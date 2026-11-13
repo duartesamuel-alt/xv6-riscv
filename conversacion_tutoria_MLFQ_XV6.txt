@@ -1,0 +1,2064 @@
+CONVERSACIÓN – TUTORÍA SOCRÁTICA: PROPUESTA DE MLFQ PARA XV6 (RISC-V)
+Fecha: 13 de noviembre de 2026
+======================================================================
+
+
+----------------------------------------------------------------------
+[ESTUDIANTES] – Instrucciones iniciales (archivo adjunto)
+----------------------------------------------------------------------
+
+Actúa como tutor socrático de una pareja de estudiantes de cuarto semestre de
+Ingeniería de Sistemas. Conocemos C++ y hemos comenzado a explorar XV6 para
+RISC-V.
+
+Queremos identificar y justificar qué se necesitaría para incorporar MLFQ a
+XV6. En esta entrega no vamos a implementarlo.
+
+Nuestra descripción inicial del algoritmo, escrita antes de esta conversación:
+
+👉 [1. ¿Qué problema intenta resolver MLFQ? ¿Qué tiene de malo Round Robin solo?
+
+Respuesta:
+
+MLFQ busca mejorar la forma en que se ejecutan los procesos, ya que Round Robin trata a todos por igual sin importar si necesitan mucha o poca CPU. Esto puede ser un problema porque los procesos interactivos necesitan responder rápido, mientras que los procesos que hacen muchos cálculos pueden tardar bastante. MLFQ intenta dar prioridad a los procesos que necesitan respuestas rápidas y, al mismo tiempo, permite que los procesos más largos también puedan ejecutarse.
+
+2. Las reglas como las entendemos:
+   - Regla 1: Si dos procesos tienen diferente prioridad, se ejecuta primero el que esté en la cola de mayor prioridad. Los de las colas inferiores deben esperar.
+
+   - Regla 2: Si dos procesos tienen la misma prioridad, se van turnando utilizando Round Robin, para que ambos tengan oportunidad de ejecutarse.
+
+   - Regla 3: Cuando aparece un proceso nuevo, entra a la cola de mayor prioridad, porque todavía no se sabe si va a necesitar mucha CPU o si será interactivo.
+   - Regla 4: Si un proceso consume todo el tiempo que tiene permitido en un nivel, baja al siguiente, incluso si ha soltado la CPU varias veces antes. Esto evita que algunos procesos intenten quedarse siempre en las colas superiores.
+
+   - Regla 5: Cada cierto tiempo todos los procesos vuelven a la cola de mayor prioridad. Esto sirve para que los procesos que llevan mucho tiempo abajo tengan otra oportunidad y no se queden esperando para siempre.
+
+3.Parámetros que el algoritmo necesita (y qué valores se nos ocurren):
+
+   - Número de colas: 3 colas, para tener una prioridad alta, una media y una baja.
+
+   - Quantum de cada cola: 5 ms para la primera, 10 ms para la segunda y 20 ms para la tercera.
+
+   - Tiempo permitido (allotment) por nivel: 10 ms en cada nivel antes de bajar de prioridad.
+
+   - Período del boost (S): 100 ms, para que los procesos que están en las colas inferiores puedan volver a tener prioridad cada cierto tiempo.
+
+4. Un ejemplo pequeño:
+   Si hay un proceso A que usa mucho la CPU y un proceso B que usa poco
+   (por ejemplo, espera al teclado), ¿qué pasa con cada uno con el tiempo?
+
+Respuesta:
+Si tenemos un proceso A que utiliza mucho la CPU y un proceso B que utiliza poco porque, por ejemplo, está esperando que el usuario escriba algo en el teclado, inicialmente ambos entran en la cola de mayor prioridad.
+Con el paso del tiempo, A va consumiendo sus tiempos de CPU y probablemente termina bajando a colas inferiores. Mientras tanto, B puede seguir teniendo una prioridad alta porque normalmente utiliza poco tiempo de CPU y después vuelve a esperar.
+De esta manera, cuando el usuario presione una tecla, B podría recibir atención más rápidamente que A. Sin embargo, A no deja de ejecutarse, sino que continúa teniendo oportunidades en las colas inferiores y también puede volver a subir cuando ocurra el boost.
+
+6.	Nuestras dudas:
+
+•	   - ¿Cómo decide el sistema operativo cuánto tiempo debe durar cada quantum para que los procesos interactivos respondan rápido sin perjudicar demasiado a los procesos largos?
+
+•	   -  ¿Qué pasaría si el boost ocurre demasiado seguido? ¿Los procesos largos podrían quedarse siempre en las colas inferiores sin avanzar mucho?
+
+-	¿El sistema operativo puede identificar correctamente cuándo un proceso es interactivo o simplemente se basa en observar cuánto tiempo utiliza la CPU?
+]
+
+Lo que averiguamos del planificador original y de su incorporación al sistema
+compilado:
+
+👉 [una sola CPU virtual (make CPUS=1 qemu):
+
+- Política: Round Robin apropiativo, sin prioridades.
+- Selección: kernel/proc.c, función scheduler() (líneas 421-470). Recorre la
+  tabla proc[NPROC] (NPROC = 64) en orden y elige el primer proceso con
+  p->state == RUNNABLE; lo pasa a RUNNING y le entrega la CPU con
+  swtch(&c->context, &p->context) (línea 453). Al volver, continúa con el
+  siguiente de la tabla.
+- Estados (kernel/proc.h, línea 79): UNUSED, USED, SLEEPING, RUNNABLE,
+  RUNNING, ZOMBIE. Cada proceso tiene su campo state (struct proc, línea 86).
+- Ceder la CPU: sched() (proc.c, 480-497) hace swtch de vuelta al
+  planificador (línea 495) y exige que el proceso ya no esté en RUNNING.
+  * Por tiempo: kernel/trap.c programa la interrupción del reloj cada
+    1.000.000 de ciclos (w_stimecmp, línea 179). En usertrap (líneas 85-86)
+    y kerneltrap (157-158), si which_dev == 2 se llama a yield()
+    (proc.c, 501-508), que pone al proceso en RUNNABLE.
+  * Por espera: sleep() (proc.c, 562-572) lo pone en SLEEPING.
+  * wakeup() (proc.c, 576-595) pasa los procesos de SLEEPING a RUNNABLE.
+- Construcción: proc.o y swtch.o están en la lista OBJS del Makefile; se
+  compilan con riscv64-linux-gnu-gcc y se enlazan con kernel/kernel.ld en
+  kernel/kernel. main() (kernel/main.c, línea 44) llama a scheduler() al final
+  del arranque.
+- Experimento: con un programa propio (user/rrtest.c) que crea 3 hijos que solo
+  usan CPU, observamos que se turnan en orden circular, cada turno dura cerca de
+  un tick, y un proceso puede ser interrumpido a mitad de imprimir una línea.
+...")]
+
+Reglas de interacción:
+1. Formula una sola pregunta principal por turno y espera nuestra respuesta. No
+presentes una lista completa de cambios ni una arquitectura resuelta.
+2. Empieza examinando nuestra descripción de MLFQ. Ayúdanos a detectar reglas
+ambiguas, ausentes o contradictorias. No sustituyas nuestra descripción por una
+versión terminada ni elijas silenciosamente una variante del algoritmo.
+3. Pídenos que propongamos y justifiquemos las decisiones que faltan. Después,
+ayúdanos a comprobarlas con ejemplos pequeños de procesos y decisiones de
+planificación que nosotros debamos resolver.
+4. Guíanos para relacionar cada regla con XV6. Antes de sugerir una modificación,
+pregúntanos qué comportamiento necesitamos y qué evidencia del código respalda
+nuestra propuesta.
+5. No supongas que tienes acceso a nuestro repositorio. Pide los fragmentos
+necesarios y distingue lo observado de lo que todavía sea una hipótesis. No
+inventes archivos, funciones o comportamientos de nuestra versión.
+6. No entregues código de implementación, parches, una lista cerrada de archivos
+por modificar ni pseudocódigo que resuelva el planificador. Revisa nuestras
+propuestas y señala problemas mediante preguntas y pistas graduales. Puedes
+explicar conceptos previos con ejemplos mínimos.
+7. Si nos bloqueamos, reduce la dificultad de la pregunta y ofrece una pista
+concreta. Si pedimos la solución directa, conserva el modo socrático.
+
+El objetivo es que nosotros logremos:
+A. Redactar una descripción revisada y coherente de la variante de MLFQ
+considerada.
+B. Explicar qué cambios necesitaría XV6 para soportarla, indicando para cada uno
+su propósito, su relación con las reglas y la evidencia del código que lo
+justifica.
+C. Proponer escenarios para comprobar una futura implementación del algoritmo
+MLFQ en el sistema operativo XV6. Pídenos que expliquemos qué procesos
+participarían, qué harían, qué regla comprobaríamos y qué comportamiento
+esperaríamos observar. No nos entregues los escenarios resueltos. En esta tarea
+solo los describiremos; no vamos a programarlos ni ejecutarlos.
+
+Mantén el análisis dentro del alcance de una propuesta: no necesitamos
+implementar MLFQ ni construir un selector de planificadores. Ayúdanos a
+registrar las cuestiones que queden pendientes de investigación.
+
+Al finalizar, pídenos que redactemos nuestras conclusiones. Comprueba su
+consistencia mediante una última pregunta aplicada a un caso concreto, sin
+escribir por nosotros el reporte.
+
+Comienza con una pregunta que permita comprobar cómo entendemos una regla de
+nuestra descripción inicial de MLFQ.
+
+
+----------------------------------------------------------------------
+[TUTOR]
+----------------------------------------------------------------------
+
+Empecemos por la Regla 4, que con sus propios parámetros (quantum de 5 ms y
+allotment de 10 ms en la cola alta) se puede poner a prueba.
+
+Caso: Un proceso C acaba de llegar, así que está en la cola de mayor
+prioridad. No hay más procesos listos. Esto es lo que hace:
+
+1. Usa la CPU 3 ms y se bloquea esperando el teclado.
+2. Se despierta, usa la CPU 4 ms y se bloquea de nuevo.
+3. Se despierta y quiere usar la CPU durante 6 ms seguidos.
+
+Pregunta: Según su Regla 4 y sus parámetros, ¿en qué momento exacto baja C a
+la cola media? ¿Cuánto tiempo de CPU lleva acumulado en ese nivel cuando
+ocurre?
+
+Respondan con base en lo que escribieron, sin cambiar todavía las reglas. Si
+al resolverlo encuentran que su descripción permite más de una respuesta,
+anoten cuáles son y en qué parte de la regla se origina la ambigüedad.
+
+
+----------------------------------------------------------------------
+[ESTUDIANTES]
+----------------------------------------------------------------------
+
+Según lo que planteamos, C baja a la cola media cuando acumula 10 ms de uso de
+CPU en la cola alta, sin importar que se haya bloqueado varias veces para
+esperar el teclado.
+
+Veamos cómo ocurre:
+Acción              Tiempo de CPU utilizado   Acumulado
+Primera ejecución   3 ms                      3 ms
+Segunda ejecución   4 ms                      7 ms
+Tercera ejecución   3 ms                      10 ms
+
+En la tercera ejecución, C necesita 6 ms seguidos, pero solamente puede
+utilizar 3 ms más antes de completar su allotment de 10 ms.
+
+Respuesta: C baja a la cola media exactamente después de ejecutar esos 3 ms de
+su tercera ejecución. En ese momento lleva acumulados 10 ms de CPU en la cola
+alta.
+
+Nuestra duda o ambigüedad: Inicialmente podríamos pensar que, como el quantum
+es de 5 ms, C tendría que terminar sus 5 ms antes de bajar. Sin embargo, la
+regla 4 habla del tiempo acumulado (allotment) y no solamente del quantum. Por
+eso, entendemos que debe bajar al completar los 10 ms, aunque eso ocurra antes
+de terminar el quantum de esa ejecución.
+
+
+----------------------------------------------------------------------
+[TUTOR]
+----------------------------------------------------------------------
+
+Es una decisión válida y está bien justificada: el allotment manda sobre el
+quantum. Si se agota a mitad de un quantum, el proceso baja en ese momento.
+Anótenla como Decisión 1 en su descripción revisada, porque el texto original
+no lo decía.
+
+Con esa decisión, revisemos qué papel le queda al quantum en las otras colas.
+Sus parámetros dicen:
+
+| Cola  | Quantum | Allotment |
+|-------|---------|-----------|
+| Alta  | 5 ms    | 10 ms     |
+| Media | 10 ms   | 10 ms     |
+| Baja  | 20 ms   | 10 ms     |
+
+Caso: El proceso D solo hace cálculos y ya está en la cola baja. No hay más
+procesos listos. D quiere usar la CPU durante 30 ms seguidos.
+
+Pregunta: Aplicando la Decisión 1 y la Regla 4, ¿qué le pasa a D cuando cumple
+10 ms en la cola baja? ¿Y qué ocurre a los 20 ms?
+
+Al responder, fíjense en dos cosas:
+- ¿Su descripción dice qué pasa cuando un proceso agota su allotment y ya no
+  hay una cola inferior?
+- En la cola baja, ¿llega a usarse en algún momento el quantum de 20 ms? Si no,
+  ¿qué cambiarían: el valor, la regla o ambos? ¿Por qué?
+
+
+----------------------------------------------------------------------
+[ESTUDIANTES]
+----------------------------------------------------------------------
+
+Según nuestra Decisión 1, el allotment tiene prioridad sobre el quantum. Por
+lo tanto, cuando D completa 10 ms de ejecución en la cola baja, debería agotar
+su allotment y bajar de nivel. Sin embargo, aquí encontramos un problema: la
+cola baja es la última, así que no existe otra cola a la cual pueda bajar.
+
+* A los 10 ms: D agota su allotment, pero no tenemos definida una regla que
+  indique qué sucede cuando ya está en la última cola. Creemos que podría
+  permanecer en la cola baja y continuar ejecutándose.
+* A los 20 ms: D habría completado otros 10 ms de CPU. Sin embargo, tampoco
+  sabemos si se reinicia su allotment o si simplemente continúa ejecutándose.
+
+Sobre el quantum de 20 ms: Nos damos cuenta de que, con los parámetros
+actuales, el quantum de la cola baja nunca llegaría a utilizarse
+completamente, porque el allotment se agota a los 10 ms. Esto hace que el
+quantum de 20 ms pierda su utilidad.
+Lo que cambiaríamos: Consideramos que sería mejor modificar el allotment de la
+cola baja para que sea igual o superior al quantum de 20 ms. Así tendría
+sentido mantener ese quantum y permitir que los procesos largos aprovechen más
+tiempo de CPU antes de que se evalúe nuevamente su prioridad.
+También dejaríamos pendiente definir qué sucede cuando un proceso agota su
+allotment en la última cola, porque nuestra descripción inicial no contempla
+ese caso.
+
+
+----------------------------------------------------------------------
+[TUTOR]
+----------------------------------------------------------------------
+
+Bien visto. Encontraron dos huecos en su descripción, y ninguno de los dos es
+para investigar después: son decisiones de diseño que les toca tomar a
+ustedes. Para eso, agreguemos un segundo proceso.
+
+Caso: D y E solo hacen cálculos y los dos están en la cola baja. No hay nadie
+en las colas superiores. Supongan que D acaba de empezar a ejecutarse.
+
+Pregunta: ¿Qué hace que D le ceda la CPU a E: el quantum, el allotment o
+ninguno de los dos? Y, en esta cola, ¿qué diferencia observable habría entre
+que D "agote su allotment" y que D "agote su quantum"?
+
+Pista: piensen qué consecuencia tiene agotar el allotment en las colas alta y
+media. Luego pregúntense si esa consecuencia puede darse en la última cola.
+Con eso pueden escribir la Decisión 2, que dice qué significa el allotment, si
+es que significa algo, en la cola baja. También deberían revisar si su
+propuesta de subir ese allotment a 20 ms o más sigue teniendo sentido.
+
+
+----------------------------------------------------------------------
+[ESTUDIANTES]
+----------------------------------------------------------------------
+
+Según lo que hemos planteado, consideramos que D debe cederle la CPU a E
+cuando agote su quantum de 20 ms, utilizando Round Robin entre los procesos
+que están en la misma cola.
+La diferencia entre agotar el quantum y el allotment sería la siguiente:
+
+* Agotar el quantum: D termina su turno de 20 ms y debe ceder la CPU para que
+  E tenga la oportunidad de ejecutarse. Después, D puede volver a ejecutarse
+  cuando le corresponda.
+* Agotar el allotment: En las colas alta y media esto significa que el proceso
+  baja de prioridad. Sin embargo, en la cola baja no existe otra cola
+  inferior, por lo que no tendría sentido aplicar esa misma consecuencia.
+
+Decisión 2: Decidimos que en la cola baja el allotment no provoca una
+reducción de prioridad, porque ya se encuentra en el último nivel. En cambio,
+el quantum de 20 ms sí se mantiene y determina cuándo un proceso debe ceder la
+CPU para darle el turno a otro proceso de la misma cola.
+Por esta razón, creemos que sí tiene sentido aumentar el allotment de la cola
+baja a 20 ms o más, pero también consideramos que podría ser innecesario si ya
+decidimos que este no tiene ninguna consecuencia en ese nivel. Lo más sencillo
+sería dejar el allotment únicamente para las colas donde todavía existe la
+posibilidad de bajar de prioridad.
+Nuestra conclusión: En la cola baja, el quantum sirve para repartir la CPU
+entre procesos, mientras que el allotment deja de ser necesario porque no hay
+otro nivel al cual descender.
+
+
+----------------------------------------------------------------------
+[TUTOR]
+----------------------------------------------------------------------
+
+La Decisión 2 es coherente: en la última cola el allotment no tiene
+consecuencias y solo el quantum reparte la CPU. Para que la descripción
+revisada quede sin ambigüedades, escríbanla así: "en la cola baja no se lleva
+allotment". No la dejen como "20 ms o más".
+
+Ahora veamos la Regla 1. Ustedes escribieron que los procesos de las colas
+inferiores "deben esperar". Eso deja claro qué pasa antes de elegir a quién
+ejecutar, pero no dice nada de un proceso que ya está en ejecución.
+
+Caso: D, en la cola baja, lleva 4 ms de su quantum de 20 ms. En ese momento el
+usuario presiona una tecla y B, que estaba en la cola alta esperando el
+teclado, pasa a estar listo.
+
+Pregunta: ¿Qué debe pasar en ese instante: D sigue hasta terminar su quantum o
+se interrumpe para que se ejecute B? Si deciden que se interrumpe, cuando D
+vuelva a ejecutarse, ¿cuánto quantum le queda: 16 ms o 20 ms otra vez?
+
+Justifiquen cada respuesta con el problema que, según su punto 1, intenta
+resolver MLFQ. Si hay que interrumpir a D, ¿qué gana B? Y si D recupera sus
+20 ms completos, ¿qué podría aprovechar un proceso de la cola baja?
+
+
+----------------------------------------------------------------------
+[ESTUDIANTES]
+----------------------------------------------------------------------
+
+Consideramos que D debe ser interrumpido inmediatamente cuando B pasa a estar
+listo, aunque todavía no haya terminado su quantum de 20 ms. Esto se debe a
+que B pertenece a la cola de mayor prioridad y MLFQ busca que los procesos
+interactivos puedan responder rápidamente.
+
+* ¿Qué pasa con D? D deja de ejecutarse después de esos 4 ms y queda
+  esperando en la cola baja.
+* ¿Cuánto quantum le queda cuando vuelva a ejecutarse? Consideramos que le
+  quedan 16 ms, porque ya utilizó 4 ms de su turno y no tendría sentido
+  reiniciarle los 20 ms.
+
+Justificación: Si D pudiera continuar hasta completar sus 20 ms, B tendría
+que esperar demasiado tiempo para recibir atención, lo cual iría en contra del
+objetivo de MLFQ de favorecer los procesos interactivos.
+Por otro lado, si D recuperara sus 20 ms completos cada vez que fuera
+interrumpido, un proceso de la cola baja podría aprovechar esas interrupciones
+para obtener más tiempo de CPU del que realmente le corresponde. Esto podría
+perjudicar a los procesos de mayor prioridad.
+Nuestra conclusión: La prioridad de la cola alta debe imponerse
+inmediatamente sobre la cola baja. D conserva el tiempo de quantum que le
+quedó pendiente, mientras B puede ejecutarse rápidamente y responder a la
+interacción del usuario.
+
+
+----------------------------------------------------------------------
+[TUTOR]
+----------------------------------------------------------------------
+
+Aceptamos la Decisión 3: un proceso de mayor prioridad que pasa a estar listo
+interrumpe de inmediato al que se está ejecutando, y el proceso interrumpido
+conserva lo que le quedaba de quantum.
+
+Pero revisen una parte de su justificación. Dicen que si D recuperara los
+20 ms completos, "perjudicaría a los procesos de mayor prioridad". Piensen en
+esto: cada vez que B se despierta, interrumpe a D de todas formas, así que B
+no pierde nada. Entonces, ¿quién sale perjudicado si D recupera los 20 ms
+completos? Corrijan esa frase, porque de ella depende la siguiente pregunta.
+
+Caso: E también está listo en la cola baja. B usa la CPU 1 ms y vuelve a
+bloquearse. Ahora, en la cola baja quedan D, con 16 ms de quantum pendientes,
+y E, que no se ha ejecutado desde hace rato.
+
+Pregunta: ¿A quién se elige primero? ¿D retoma su turno al frente de la cola o
+se va al final, detrás de E?
+
+Comparen las dos opciones con este caso extremo: B se despierta cada 4 ms
+durante mucho tiempo. Con cada opción, ¿cuánta CPU recibe D y cuánta recibe
+E? ¿Cuál de las dos opciones respeta mejor la Regla 2, que dice que los
+procesos de la misma cola se turnan?
+
+
+----------------------------------------------------------------------
+[ESTUDIANTES]
+----------------------------------------------------------------------
+
+Primero corregimos nuestra justificación anterior: si D recuperara sus 20 ms
+completos, quien realmente saldría perjudicado sería E, porque D podría
+acumular más tiempo de ejecución que otros procesos de su misma cola. B no
+sería el perjudicado, ya que siempre tendría prioridad sobre D cuando se
+despierte.
+¿A quién se elige primero?
+Consideramos que E debe ejecutarse primero y que D debe ir al final de la
+cola, detrás de E. Aunque D fue interrumpido antes de terminar su quantum, ya
+tuvo su oportunidad de utilizar la CPU y debe respetar el turno de los demás
+procesos.
+Comparación de las dos opciones:
+
+* Opción 1: D retoma al frente de la cola. D tendría prioridad sobre E cada
+  vez que B se bloquee. Si B se despierta cada 4 ms, D podría aprovechar esos
+  pequeños espacios de CPU repetidamente, mientras E tendría que seguir
+  esperando.
+* Opción 2: D pasa al final de la cola. E tiene la oportunidad de ejecutarse
+  antes que D. De esta manera, ambos procesos pueden repartirse mejor los
+  espacios de CPU que deja B cuando se bloquea.
+
+Decisión 4: Cuando un proceso de una cola inferior es interrumpido por otro de
+mayor prioridad, conserva el quantum que le queda, pero pasa al final de su
+cola. Así se respeta mejor el funcionamiento de Round Robin entre procesos de
+la misma prioridad.
+Nuestra conclusión: Elegimos la segunda opción porque evita que D tenga una
+ventaja constante sobre E y permite que ambos procesos reciban oportunidades
+de ejecución, incluso cuando hay procesos interactivos que se despiertan
+frecuentemente.
+
+
+----------------------------------------------------------------------
+[TUTOR]
+----------------------------------------------------------------------
+
+La corrección es acertada: quien sale perjudicado es E. Antes de aceptar la
+Decisión 4, comprueben con números la comparación que hicieron. En la
+Opción 1 dijeron que "E tendría que seguir esperando", pero no tuvieron en
+cuenta algo que ustedes mismos decidieron en la Decisión 3.
+
+Caso (Opción 1: D retoma al frente y conserva lo que le queda de quantum): D
+empieza un quantum nuevo de 20 ms. B se despierta cada 4 ms, usa 1 ms y
+vuelve a bloquearse. E espera en la cola baja.
+
+Pregunta: Hagan una línea de tiempo de los primeros ~25 ms. En cada fragmento,
+indiquen quién se ejecuta y cuánto quantum le queda a D. ¿Llega E a
+ejecutarse en algún momento? ¿Cuándo?
+
+Después respondan dos cosas:
+- ¿La Opción 1 deja a E esperando indefinidamente, o solo cambia el orden de
+  los turnos? ¿Qué fue lo que realmente causaba la injusticia en la pregunta
+  anterior: retomar al frente o reiniciar el quantum a 20 ms?
+- Con la Opción 2, D va al final pero conserva 16 ms. Cuando le vuelva a
+  tocar, ¿qué consecuencia práctica tiene que conserve 16 ms en vez de recibir
+  20? ¿Siguen siendo compatibles las Decisiones 3 y 4 tal como están escritas?
+
+
+----------------------------------------------------------------------
+[ESTUDIANTES]
+----------------------------------------------------------------------
+
+Al revisar el caso con números, nos damos cuenta de que nuestra conclusión
+anterior fue un poco apresurada. Si D retoma al frente de la cola, pero
+conserva su quantum restante, E no necesariamente se queda esperando para
+siempre.
+
+1. Línea de tiempo (Opción 1)
+Suponiendo que D comienza con 20 ms de quantum y que B se despierta cada
+4 ms, utiliza 1 ms y vuelve a bloquearse:
+
+Tiempo     Proceso que se ejecuta   Quantum restante de D
+0–4 ms     D                        16 ms
+4–5 ms     B                        16 ms
+5–8 ms     D                        13 ms
+8–9 ms     B                        13 ms
+9–12 ms    D                        10 ms
+12–13 ms   B                        10 ms
+13–16 ms   D                        7 ms
+16–17 ms   B                        7 ms
+17–20 ms   D                        4 ms
+20–21 ms   B                        4 ms
+21–24 ms   D                        1 ms
+24–25 ms   B                        1 ms
+
+En este ejemplo, E todavía no alcanza a ejecutarse durante los primeros
+25 ms. Sin embargo, D ya está cerca de terminar su quantum y, cuando lo
+agote, E podrá tener su turno.
+
+2. ¿La Opción 1 deja a E esperando indefinidamente?
+No necesariamente. La Opción 1 solamente cambia el orden de los turnos, pero
+no significa que E nunca pueda ejecutarse.
+
+Nos damos cuenta de que el verdadero problema de injusticia que habíamos
+identificado anteriormente era reiniciar el quantum de D a 20 ms cada vez que
+B lo interrumpiera. Eso permitiría que D recibiera más tiempo de CPU del que
+le corresponde.
+
+3. ¿Qué pasa si D conserva sus 16 ms?
+Con la Opción 2, D pasa al final de la cola y conserva sus 16 ms pendientes.
+Esto significa que E puede ejecutarse primero y después D continúa utilizando
+únicamente el tiempo que le quedaba.
+
+Si D recibiera nuevamente 20 ms, estaría obteniendo tiempo adicional sin
+haberlo ganado, lo cual afectaría el reparto de CPU entre los procesos de la
+misma cola.
+
+4. ¿Son compatibles las Decisiones 3 y 4?
+Creemos que sí. La Decisión 3 establece que los procesos de mayor prioridad
+pueden interrumpir inmediatamente a los de menor prioridad, mientras que la
+Decisión 4 establece que el proceso interrumpido conserva su quantum, pero
+pasa al final de su cola.
+
+Ambas decisiones pueden funcionar juntas porque una determina cuándo ocurre
+la interrupción y la otra qué sucede con el proceso después de ser
+interrumpido.
+
+Nuestra conclusión: Después de hacer la simulación, entendemos que retomar al
+frente no necesariamente provoca hambruna, pero pasar al final permite
+repartir mejor las oportunidades entre procesos de la misma prioridad. Por
+eso seguimos considerando que la Opción 2 es más justa.
+
+
+----------------------------------------------------------------------
+[TUTOR]
+----------------------------------------------------------------------
+
+La línea de tiempo está bien hecha: E se ejecuta en el ms 25, cuando D agota
+su quantum. Encontraron la causa real de la injusticia, que era reiniciar el
+quantum y no la posición en la cola. Pueden quedarse con la Decisión 4, pero
+en su reporte justifiquen un detalle: con la Opción 2, cuando interrumpen a
+D, pierde dos cosas a la vez: su lugar en la cola y la parte del turno que ya
+había usado. Es defendible, pero deben explicar por qué les parece justo que
+pierda ambas.
+
+Pasemos a la Regla 5 (boost), que hasta ahora no hemos revisado. Su texto
+dice que cada 100 ms "todos los procesos vuelven a la cola de mayor
+prioridad", pero no aclara qué pasa con los contadores que fueron definiendo
+en las decisiones anteriores.
+
+Caso: En t = 100 ms ocurre el boost. En ese instante hay tres procesos:
+- C, en la cola media, ya consumió 9 ms de los 10 ms de allotment de ese
+  nivel.
+- D, en la cola baja, se está ejecutando y le quedan 7 ms de quantum.
+- E, en la cola baja, está listo y esperando.
+
+Pregunta: Justo después del boost, ¿qué allotment acumulado y qué quantum
+restante tiene cada uno? ¿En qué orden quedan dentro de la cola alta?
+
+Para decidir, comparen dos opciones para C:
+- Opción a: C conserva los 9 ms acumulados.
+- Opción b: C empieza de cero.
+
+En cada opción, ¿cuánto tiempo pasa C en la cola alta antes de volver a
+bajar? ¿Cuál de las dos cumple el propósito que ustedes mismos le dieron a la
+Regla 5: darles "otra oportunidad" a los procesos que llevan tiempo abajo?
+
+
+----------------------------------------------------------------------
+[ESTUDIANTES]
+----------------------------------------------------------------------
+
+Consideramos que el boost debe reiniciar los contadores de allotment y
+quantum de los procesos, porque la idea es darles una nueva oportunidad y
+permitir que vuelvan a competir en igualdad de condiciones en la cola de
+mayor prioridad.
+
+1. ¿Qué pasa con cada proceso después del boost?
+
+* C: Pasa de la cola media a la cola alta y reinicia su allotment. Por lo
+  tanto, queda con 0 ms acumulados de los 10 ms permitidos.
+* D: Pasa de la cola baja a la cola alta. Como tenía 7 ms de quantum
+  restante, consideramos que recibe un quantum nuevo de 5 ms, correspondiente
+  a la cola alta.
+* E: También pasa a la cola alta y recibe un quantum nuevo de 5 ms.
+
+El orden dentro de la cola alta sería:
+1. C
+2. D
+3. E
+
+Esto suponiendo que C ya estaba en una cola superior y que los procesos que
+estaban abajo se agregan después, conservando su orden relativo.
+
+2. Comparación de las dos opciones para C
+Opción A: C conserva los 9 ms acumulados.
+Si C conserva su allotment, solamente tendría 1 ms disponible antes de volver
+a bajar a la cola media. Esto significa que prácticamente no aprovecharía el
+boost, porque volvería a perder su prioridad después de ejecutar muy poco
+tiempo.
+Opción B: C empieza desde cero.
+C tendría nuevamente sus 10 ms de allotment en la cola alta. De esta manera,
+podría utilizar más tiempo de CPU antes de volver a bajar a la cola media.
+
+3. ¿Qué opción elegiríamos?
+Elegiríamos la opción B, porque consideramos que cumple mejor el propósito de
+la Regla 5. Si el objetivo es darles otra oportunidad a los procesos que
+llevan mucho tiempo en las colas inferiores, no tendría mucho sentido
+conservar un contador que está a punto de agotarse.
+Decisión 5: Cuando ocurre el boost, todos los procesos vuelven a la cola de
+mayor prioridad y sus contadores de allotment y quantum se reinician según
+los valores correspondientes a esa cola.
+
+4. Nuestra duda
+No estamos completamente seguros de si reiniciar el quantum también es
+obligatorio o si solamente debería reiniciarse el allotment. Entendemos que
+reiniciar ambos permite que todos comiencen con las mismas condiciones, pero
+también podría hacer que algunos procesos reciban más tiempo de CPU del que
+tenían pendiente antes del boost.
+
+
+----------------------------------------------------------------------
+[TUTOR]
+----------------------------------------------------------------------
+
+La Decisión 5 está bien argumentada. Para resolver su duda sobre el quantum,
+revisen sus propios números: D tenía 7 ms pendientes y después del boost
+recibe 5 ms, o sea que pierde tiempo en lugar de ganarlo. ¿En qué caso un
+proceso sí ganaría con el reinicio? Por ejemplo, uno de la cola media al que
+le quedara 1 ms de quantum. Comparen esa ganancia, que es como máximo de unos
+pocos ms cada 100 ms, con el hecho de que el allotment ya se reinicia
+completo. Con eso pueden decidir si vale la pena complicar la regla. Escriban
+la conclusión en su reporte.
+
+Antes de pasar a XV6, conviene consolidar el objetivo A. Ya tienen las
+Reglas 1 a 5 y las Decisiones 1 a 5, pero repartidas en varios mensajes, y
+hay un caso frecuente que todavía no definen: un proceso que se bloquea por
+su cuenta y después se despierta. Por ejemplo, B usa 1 ms de su quantum de
+5 ms, se queda esperando el teclado y luego se despierta.
+
+Pregunta: Redacten la descripción revisada de su variante de MLFQ en un solo
+texto. Integren las reglas y las decisiones, y corrijan los parámetros que
+cambiaron (el allotment de la cola baja, por ejemplo). Agreguen además una
+regla que diga qué pasa con un proceso que se bloquea y se despierta:
+- ¿Conserva su allotment acumulado?
+- Al despertar, ¿tiene el quantum restante (4 ms) o uno nuevo (5 ms)?
+- ¿Se coloca al final o al frente de su cola?
+
+Justifiquen cada respuesta. Tengan en cuenta que lo que decidan aquí debe ser
+coherente con la Regla 4 ("incluso si ha soltado la CPU varias veces") y con
+la Decisión 4.
+
+
+----------------------------------------------------------------------
+[ESTUDIANTES] – Archivo adjunto: Descripción revisada
+----------------------------------------------------------------------
+
+Descripción revisada de nuestra variante MLFQ
+Nuestra variante de MLFQ busca darle prioridad a los procesos interactivos,
+que necesitan respuestas rápidas, sin dejar de permitir que los procesos que
+utilizan mucha CPU puedan terminar. Para esto utilizamos tres colas con
+diferentes prioridades y tiempos de ejecución.
+
+1. Reglas de funcionamiento
+- Regla 1: Si un proceso de una cola de mayor prioridad pasa a estar listo,
+  interrumpe inmediatamente al proceso que se esté ejecutando en una cola
+  inferior.
+- Regla 2: Si varios procesos tienen la misma prioridad, se utiliza Round
+  Robin para repartir el tiempo de CPU entre ellos.
+- Regla 3: Todos los procesos nuevos entran inicialmente a la cola de mayor
+  prioridad, porque todavía no sabemos cuánto van a utilizar la CPU.
+- Regla 4: Cuando un proceso acumula todo su allotment en un nivel, baja al
+  siguiente nivel, incluso si ha soltado la CPU varias veces antes. El
+  allotment se cuenta de manera acumulada y no se reinicia cuando el proceso
+  se bloquea.
+- Regla 5: Cada 100 ms ocurre un boost, donde todos los procesos vuelven a la
+  cola de mayor prioridad. En ese momento se reinician sus contadores de
+  allotment y quantum según los valores de la cola alta.
+
+2. Parámetros de las colas
+Parámetro   Cola alta   Cola media   Cola baja
+Quantum     5 ms        10 ms        20 ms
+Allotment   10 ms       10 ms        No se utiliza
+
+Decidimos no utilizar allotment en la cola baja porque es el último nivel y
+no existe otra cola inferior a la cual puedan descender los procesos. En este
+nivel, el quantum es el encargado de repartir la CPU entre los procesos.
+
+3. Decisiones adicionales
+Decisión 1: El allotment tiene prioridad sobre el quantum.
+Si un proceso completa su allotment antes de terminar su quantum, baja
+inmediatamente al siguiente nivel. Por ejemplo, si le quedan 3 ms de
+allotment y todavía tiene 5 ms de quantum, solamente ejecutará los 3 ms
+restantes antes de bajar.
+
+Decisión 2: En la cola baja no se lleva allotment.
+Los procesos permanecen en este nivel y utilizan Round Robin con un quantum
+de 20 ms.
+
+Decisión 3: Interrupción por prioridad.
+Si un proceso de mayor prioridad pasa a estar listo, interrumpe
+inmediatamente al que se está ejecutando. El proceso interrumpido conserva el
+quantum que le quedaba.
+
+Decisión 4: Posición después de una interrupción.
+Cuando un proceso es interrumpido por otro de mayor prioridad, conserva su
+quantum restante, pero pasa al final de su cola. Consideramos que esto
+permite repartir mejor las oportunidades entre procesos de la misma prioridad
+y evita que uno tenga ventaja constante sobre los demás.
+
+Decisión 5: Reinicio de contadores durante el boost.
+Cuando ocurre el boost, todos los procesos vuelven a la cola alta y reinician
+sus contadores de allotment y quantum. Consideramos que es más sencillo
+darles una nueva oportunidad con los valores del nivel superior, aunque
+reconocemos que algunos procesos pueden ganar unos milisegundos de quantum
+con este reinicio. Esa pequeña ganancia nos parece aceptable frente al
+beneficio de evitar la hambruna.
+
+4. ¿Qué pasa cuando un proceso se bloquea y después se despierta?
+Decidimos que cuando un proceso se bloquea voluntariamente, conserva tanto su
+allotment acumulado como el quantum que todavía le quedaba.
+
+Por ejemplo, si B está en la cola alta, utiliza 1 ms de su quantum de 5 ms y
+después se bloquea esperando el teclado:
+- Conserva sus 4 ms de quantum restante.
+- Conserva el 1 ms de allotment que ya había consumido.
+- Cuando se despierta, vuelve al final de su cola, detrás de los procesos que
+  ya estaban esperando.
+Tomamos esta decisión porque no queremos que los procesos puedan evitar bajar
+de prioridad simplemente bloqueándose antes de terminar su quantum. Esto
+mantiene la coherencia con la Regla 4, que establece que el tiempo de CPU
+utilizado se acumula aunque el proceso se bloquee varias veces.
+
+También nos parece justo que vuelva al final de su cola porque los otros
+procesos ya estaban esperando su turno y no deberían perderlo cuando B se
+despierte.
+
+5. Conclusión
+Nuestra variante de MLFQ intenta equilibrar la rapidez de respuesta de los
+procesos interactivos con la ejecución de los procesos que necesitan más
+tiempo de CPU. Para conseguirlo, utilizamos diferentes prioridades, quantum y
+allotment, además de interrupciones por prioridad y un boost cada 100 ms.
+
+Reconocemos que algunos valores son decisiones nuestras para la simulación y
+que podrían modificarse dependiendo de los resultados. Sin embargo,
+consideramos que las reglas planteadas permiten repartir mejor la C
+[el texto del archivo se interrumpe aquí]
+
+
+----------------------------------------------------------------------
+[TUTOR]
+----------------------------------------------------------------------
+
+La descripción quedó bastante más coherente que la inicial. El texto se corta
+al final ("repartir mejor la C…"), así que completen esa frase. Además, les
+quedan tres huecos pequeños que pueden cerrar sin que conversemos sobre
+ellos:
+
+1. Al bajar de nivel, ¿con qué quantum y con qué allotment acumulado llega el
+   proceso a la nueva cola? ¿En qué posición queda? Hoy eso solo se deduce,
+   no está escrito.
+2. Después del boost, ¿en qué orden quedan los procesos en la cola alta?
+   Ustedes ya lo resolvieron (C, D, E), pero no lo pasaron al texto.
+3. En la sección 4, el argumento contra "bloquearse para no bajar" ya lo
+   cubre el allotment acumulado. Entonces, ¿qué evita conservar también el
+   quantum restante? Y en la Decisión 5, ¿reiniciar el quantum tiene que ver
+   con la hambruna, o eso lo resuelve el traslado a la cola alta?
+
+Ahora pasemos a XV6 (objetivo B). Todos sus parámetros están en
+milisegundos: 5, 10 y 20 ms, y un boost cada 100 ms. Antes de plantear
+cualquier cambio, hay que saber con qué precisión puede XV6 medir el tiempo.
+
+En su análisis del planificador original anotaron dos observaciones:
+- trap.c programa la interrupción del reloj cada 1.000.000 de ciclos
+  (w_stimecmp, línea 179).
+- En su experimento, "cada turno dura cerca de un tick".
+
+Pero en ningún lugar dicen cuántos milisegundos dura un tick en su XV6
+corriendo en QEMU.
+
+Pregunta: ¿Cuánto dura un tick en su sistema y qué evidencia tienen de ese
+valor? Revisen si junto a la línea 179 hay algún comentario sobre esa
+duración y péguenme el fragmento, o propongan cómo lo medirían. Después, con
+ese valor, ¿se pueden representar en XV6 un quantum de 5 ms y un boost de
+100 ms? Si no se puede, ¿qué tendrían que cambiar: los parámetros, la
+frecuencia del reloj o la unidad en que expresan las reglas?
+
+Separen lo que observaron en el código de lo que suponen.
+
+
+----------------------------------------------------------------------
+[ESTUDIANTES]
+----------------------------------------------------------------------
+
+Vamos a separar esta respuesta en dos partes: primero cerramos los detalles
+pendientes de nuestra variante MLFQ y después analizamos qué podemos afirmar
+sobre los ticks de XV6.
+
+A. Correcciones a nuestra descripción de MLFQ
+
+1. ¿Qué pasa cuando un proceso baja de nivel?
+Cuando un proceso agota su allotment en una cola, pasa a la siguiente cola
+con las siguientes condiciones:
+* Su quantum se reinicia con el valor correspondiente a la nueva cola.
+* Su allotment acumulado comienza desde cero en el nuevo nivel.
+* Se coloca al final de la nueva cola, detrás de los procesos que ya estaban
+  esperando.
+Consideramos que esto es lo más ordenado porque cada nivel tiene sus propios
+tiempos y prioridades.
+
+2. Orden de los procesos después del boost
+Cuando ocurre el boost, todos los procesos pasan a la cola alta. Para evitar
+confusiones, establecemos que los procesos que ya estaban en niveles
+superiores conservan su orden relativo y después se agregan los que vienen de
+las colas inferiores, también conservando su orden.
+En nuestro ejemplo, el orden sería:
+1. C
+2. D
+3. E
+
+3. Bloqueo voluntario y reinicio del quantum
+El allotment acumulado evita que un proceso pueda bloquearse repetidamente
+para evitar bajar de prioridad. Sin embargo, conservar el quantum restante
+también tiene una función diferente: evita que un proceso obtenga turnos
+adicionales de CPU cada vez que se bloquea y despierta.
+Por ejemplo, si B utiliza 1 ms de sus 5 ms y se bloquea, al despertar
+conserva los 4 ms restantes. No recibe otros 5 ms.
+Respecto al boost, reconocemos que reiniciar el quantum no es lo que evita la
+hambruna. Eso lo consigue principalmente el traslado de todos los procesos a
+la cola alta. El reinicio del quantum es una decisión adicional para que
+todos comiencen con el tiempo correspondiente a ese nivel.
+
+4. Conclusión de la descripción
+Nuestra variante busca repartir mejor la CPU entre los procesos interactivos
+y los que necesitan realizar cálculos largos, evitando que unos tengan
+ventajas constantes sobre otros.
+
+
+----------------------------------------------------------------------
+[TUTOR]
+----------------------------------------------------------------------
+
+Parte A cerrada. El punto 1 completa la descripción. En el punto 3
+corrigieron bien lo del boost. Sobre el quantum que se conserva al
+bloquearse, su argumento se sostiene: el proceso no recibe un turno completo
+nuevo cada vez que despierta, y eso protege a los demás procesos de su cola.
+Incorporen estos cuatro puntos al documento y la descripción revisada
+(objetivo A) queda lista.
+
+Lo que no llegó es la parte B: el mensaje termina antes de hablar de los
+ticks. Como es el primer contacto con el hardware, les doy una pista gradual.
+
+Paso 1, observación: abran kernel/trap.c alrededor de la línea 179 y copien
+la línea de w_stimecmp junto con el comentario que tenga encima o al lado, si
+es que hay uno. Algunas versiones de xv6-riscv dicen ahí cuánto dura el
+intervalo en QEMU. Confirmen si la suya lo dice y qué dice exactamente.
+
+Paso 2, si no hay comentario: el registro de tiempo de RISC-V no cuenta
+ciclos del procesador, sino ticks de un reloj con frecuencia fija. En la
+máquina virt de QEMU esa frecuencia es de 10 MHz. Este dato viene de mí y no
+del código de ustedes, así que anótenlo como hipótesis hasta confirmarlo. Con
+él, calculen cuánto duran 1.000.000 de unidades.
+
+Pregunta: Según lo que encuentren, ¿cuántos milisegundos dura un tick en su
+XV6? Con ese valor, ¿cuántos ticks serían un quantum de 5 ms, uno de 20 ms y
+un boost de 100 ms? Si alguno de esos valores da menos de un tick o un número
+no entero, ¿qué harían: cambiar los parámetros, hacer que el reloj interrumpa
+más seguido o expresar todas las reglas en ticks en lugar de ms? Para cada
+opción, ¿qué costo o riesgo ven?
+
+
+----------------------------------------------------------------------
+[ESTUDIANTES]
+----------------------------------------------------------------------
+
+Vamos a responder esta parte separando lo que encontramos en el código de lo
+que nos proporciona el tutor como hipótesis, porque todavía no hemos
+confirmado la frecuencia del reloj en nuestra versión de XV6.
+
+B. XV6: duración de un tick
+
+1. Observación del código
+En kernel/trap.c, alrededor de la línea 179, encontramos la siguiente
+instrucción:
+    w_stimecmp(r_time() + 1000000);
+En nuestra versión todavía debemos confirmar si aparece un comentario que
+explique cuánto dura ese intervalo. Por ahora, lo que podemos afirmar es que
+XV6 programa la siguiente interrupción sumando 1.000.000 al contador de
+tiempo.
+
+2. Cálculo de la duración de un tick
+Tomando como hipótesis el dato proporcionado por el tutor, de que el reloj de
+QEMU tiene una frecuencia de 10 MHz:
+    10 MHz = 10 000 000 unidades por segundo
+Entonces:
+    1 000 000 / 10 000 000 = 0.1 segundos
+Por lo tanto:
+    1 tick ≈ 100 ms
+
+3. ¿Cuántos ticks necesitamos para nuestros parámetros?
+Si cada tick dura aproximadamente 100 ms, obtenemos los siguientes
+resultados:
+Parámetro           Tiempo deseado   Ticks necesarios
+Quantum cola alta   5 ms             0,05
+Quantum cola media  10 ms            0,1
+Quantum cola baja   20 ms            0,2
+Boost               100 ms           1
+
+El problema es que los quantum de nuestras tres colas necesitan menos de un
+tick. Por lo tanto, con la frecuencia actual no podríamos representar
+correctamente esos tiempos.
+
+4. ¿Qué alternativas tenemos?
+Consideramos tres posibilidades:
+- Cambiar los parámetros: podríamos aumentar los quantum para que sean
+  múltiplos de 100 ms. La desventaja es que estaríamos modificando bastante
+  nuestro algoritmo y los procesos interactivos podrían tardar más en
+  responder.
+- Aumentar la frecuencia de las interrupciones: podríamos hacer que el reloj
+  interrumpa cada 5 ms. Así tendríamos quantum de 1, 2 y 4 ticks, y un boost
+  de 20 ticks. La desventaja es que habría más interrupciones y un mayor
+  trabajo para el procesador.
+- Expresar las reglas en ticks: esto facilitaría los cálculos y la
+  implementación, pero no soluciona por sí solo el problema de precisión. Si
+  un tick sigue durando 100 ms, no podemos representar quantum de 5 ms
+  simplemente cambiando la unidad.
+
+5. Nuestra decisión
+Elegiríamos aumentar la frecuencia de las interrupciones para trabajar con
+intervalos de 5 ms. De esta manera podemos conservar los parámetros
+originales de MLFQ y representar cada quantum mediante una cantidad entera de
+ticks.
+
+Reconocemos que todavía debemos comprobar la frecuencia real del reloj en
+nuestra versión de QEMU antes de implementar el cambio.
+
+Conclusión: Según la hipótesis de los 10 MHz, cada tick dura aproximadamente
+100 ms. Esta precisión no es suficiente para nuestros quantum de 5, 10 y
+20 ms, por lo que consideramos que aumentar la frecuencia del reloj sería la
+alternativa más adecuada.
+
+
+----------------------------------------------------------------------
+[TUTOR]
+----------------------------------------------------------------------
+
+El cálculo está bien hecho: con un tick de 5 ms, los quantums quedan en 1, 2
+y 4 ticks, el boost en 20 ticks y el allotment de 10 ms en 2 ticks. También
+es correcta su observación de que cambiar la unidad no resuelve el problema
+de precisión. Antes de seguir, tengo dos comentarios:
+
+- Sobre el comentario de la línea 179: ustedes tienen el archivo abierto, así
+  que no tienen que dejarlo para después; basta con mirar la línea. Mientras
+  no lo hagan, los 100 ms siguen siendo una hipótesis, y así deben aparecer
+  en el reporte.
+- Un costo que les falta en la opción elegida: en XV6 hay otras cosas que
+  miden el tiempo en ticks, además del planificador. Anoten como pendiente de
+  investigación qué partes del kernel usan el contador de ticks. Pista:
+  busquen dónde se incrementa y qué llamadas al sistema lo leen. Después
+  pregúntense qué le pasaría a un programa de usuario que hoy hace sleep(10)
+  si el tick pasa de ~100 ms a 5 ms.
+
+Ahora viene el problema más serio, porque afecta a la Regla 4. Con ticks de
+5 ms, XV6 solo se entera del paso del tiempo cuando ocurre la interrupción
+del reloj. Supongan que, en cada tick, el kernel le carga un tick de
+allotment al proceso que está ejecutándose en ese momento. Por ahora es solo
+una propuesta, no algo que hayamos visto en el código.
+
+Caso: el proceso G está en la cola alta. Repite este ciclo: se ejecuta 4 ms,
+hace una operación que lo bloquea durante 2 ms, se despierta y vuelve a
+ejecutarse. Supongan además que, por coincidencia, cada interrupción del
+reloj llega justo cuando G está bloqueado.
+
+Pregunta: Al cabo de 100 ms, ¿cuánta CPU usó G en realidad y cuánto
+allotment le contó el kernel? ¿Llega G a bajar de cola alguna vez? Comparen
+eso con lo que promete su Regla 4 ("incluso si ha soltado la CPU varias
+veces"). Si encuentran un problema, ¿qué información tendría que guardar XV6
+para medir el uso real de CPU, y en qué momentos tendría que actualizarla?
+Antes de proponer dónde, díganme qué evidencia del código tienen sobre los
+puntos en que un proceso empieza y deja de ejecutarse.
+
+
+----------------------------------------------------------------------
+[ESTUDIANTES]
+----------------------------------------------------------------------
+
+Aquí encontramos un problema importante en nuestra propuesta de
+implementación: contar el allotment únicamente cuando ocurre una
+interrupción del reloj podría producir mediciones incorrectas del uso real
+de CPU.
+
+1. ¿Cuánta CPU utilizó G realmente?
+G repite el siguiente ciclo:
+- Ejecuta durante 4 ms.
+- Se bloquea durante 2 ms.
+- Vuelve a ejecutarse.
+Cada ciclo dura 6 ms, pero solamente 4 ms corresponden al uso de CPU.
+En 100 ms, aproximadamente:
+    CPU utilizada = 100 × 4/6 ≈ 66.67 ms de CPU
+Por lo tanto, G utiliza aproximadamente 66,67 ms de CPU y permanece
+bloqueado unos 33,33 ms.
+
+2. ¿Cuánto allotment le cuenta el kernel?
+Si el kernel solamente descuenta un tick de allotment al proceso que está
+ejecutándose cuando llega la interrupción, en este caso G no recibiría
+ningún descuento.
+Esto ocurre porque todas las interrupciones llegan justo cuando G está
+bloqueado.
+Entonces:
+Medición                          Resultado
+Tiempo real de CPU utilizado      66,67 ms
+Allotment contabilizado           0 ms
+Allotment permitido en cola alta  10 ms
+
+G nunca bajaría de cola, aunque realmente utilizó más de seis veces el
+allotment permitido.
+
+3. ¿Qué problema encontramos?
+Esto contradice nuestra Regla 4, porque habíamos establecido que el tiempo de
+CPU debía acumularse incluso cuando un proceso soltaba la CPU varias veces.
+Si solamente contamos el tiempo cuando llegan las interrupciones, un proceso
+podría bloquearse justo antes de cada tick y evitar que el sistema
+contabilice su uso de CPU.
+Por eso creemos que no es suficiente utilizar únicamente el contador de
+interrupciones para medir el allotment.
+
+4. ¿Qué información debería guardar XV6?
+Consideramos que XV6 debería guardar, como mínimo:
+- El instante en que un proceso comienza a utilizar la CPU.
+- El instante en que deja de utilizarla, ya sea porque termina su turno, se
+  bloquea o es interrumpido.
+- El tiempo de CPU acumulado por cada proceso en su nivel actual.
+Con esa información se podría calcular cuánto tiempo utilizó realmente cada
+proceso, sin importar cuántas veces se haya bloqueado.
+Por ejemplo, si G comienza a ejecutarse en un momento y después se bloquea,
+el kernel podría calcular la diferencia entre ambos instantes y sumarla a su
+allotment.
+
+5. ¿Qué evidencia necesitamos revisar en XV6?
+Antes de decidir dónde implementar estos cambios, necesitamos identificar los
+puntos del código donde el proceso comienza y deja de ejecutarse.
+Nuestra búsqueda se concentraría en:
+- kernel/proc.c: revisar la función scheduler(), porque es donde se
+  seleccionan los procesos que van a ejecutarse.
+- kernel/proc.c: revisar sched() y yield(), para entender cómo un proceso
+  deja la CPU y devuelve el control al planificador.
+- kernel/trap.c: revisar las interrupciones del reloj, porque pueden provocar
+  que un proceso ceda la CPU.
+Todavía no podemos afirmar que esos sean todos los puntos exactos donde
+tendríamos que actualizar los contadores. Primero debemos revisar el código y
+comprobar cómo se realizan las transiciones entre estados.
+
+Nuestra conclusión: Para implementar correctamente la Regla 4, necesitamos
+medir el tiempo real durante el cual cada proceso utiliza la CPU, no
+simplemente contar las interrupciones del reloj. De lo contrario, algunos
+procesos podrían consumir mucha CPU sin que el algoritmo lo detecte.
+
+
+----------------------------------------------------------------------
+[TUTOR]
+----------------------------------------------------------------------
+
+El análisis es correcto, y acaban de encontrar lo que motiva la segunda
+mitad de la Regla 4. Anótenlo en el reporte: si el allotment se cuenta por
+muestreo en cada tick, un proceso puede esquivar la Regla 4.
+
+Además, ya tienen más evidencia de la que creen. Releamos su propio resumen
+del planificador original:
+
+- "…le entrega la CPU con swtch(&c->context, &p->context) (línea 453)"
+- "sched() (proc.c, 480-497) hace swtch de vuelta al planificador
+  (línea 495)"
+
+Y en la línea que copiaron de trap.c aparece una función que lee un contador
+de tiempo con más precisión que el tick: r_time().
+
+Pregunta: La medición propuesta solo funciona si todas las formas en que un
+proceso deja la CPU pasan por el mismo punto. En su resumen mencionaron dos
+caminos hacia sched(): yield(), por tiempo, y sleep(), por espera. ¿Hay algún
+otro camino por el que un proceso deje la CPU para siempre o por un rato?
+Piensen en cómo termina un proceso. Revisen en proc.c si ese camino también
+llama a sched() y péguenme la línea que lo muestra.
+
+Con esa evidencia, digan qué par de puntos usarían como "empieza a
+ejecutarse" y "deja de ejecutarse", y qué fuente de tiempo leerían en ellos.
+Indiquen qué parte de su respuesta ya está observada en el código y qué parte
+sigue siendo hipótesis. Por ejemplo: ¿han comprobado que r_time() se puede
+leer desde el kernel en esos puntos, o solo lo suponen porque aparece en
+trap.c?
+
+
+----------------------------------------------------------------------
+[ESTUDIANTES]
+----------------------------------------------------------------------
+
+Aquí encontramos que existe otro camino importante por el cual un proceso
+puede dejar de utilizar la CPU: cuando termina su ejecución.
+
+1. ¿Existe otro camino hacia sched()?
+Además de yield() y sleep(), debemos tener en cuenta exit(), que se encarga
+de terminar un proceso.
+Al revisar proc.c, debemos buscar la función exit() y comprobar que también
+llama a sched().
+La línea que esperamos encontrar en la implementación de XV6 es:
+    sched();
+Esta llamada permite que el proceso que terminó devuelva el control al
+planificador.
+Por lo tanto, identificamos tres situaciones:
+- yield(): el proceso cede la CPU porque terminó su turno.
+- sleep(): el proceso deja la CPU porque necesita esperar algún evento.
+- exit(): el proceso termina y no vuelve a ejecutarse.
+
+2. ¿Qué puntos utilizaríamos para medir el tiempo?
+Consideramos que los dos puntos más adecuados serían:
+Inicio de ejecución: la instrucción donde el planificador entrega la CPU al
+proceso:
+    swtch(&c->context, &p->context);
+Final de ejecución: el punto común donde el proceso devuelve la CPU al
+planificador:
+    swtch(&p->context, &c->context);
+Este segundo punto se encuentra dentro de sched().
+De esta manera, podríamos calcular cuánto tiempo estuvo ejecutándose un
+proceso entre ambos cambios de contexto.
+
+3. ¿Qué fuente de tiempo utilizaríamos?
+Utilizaríamos r_time() para obtener el valor del contador de tiempo de
+RISC-V.
+La idea sería:
+1. Cuando comienza a ejecutarse un proceso, guardar el valor actual de
+   r_time().
+2. Cuando deja de ejecutarse, volver a consultar r_time().
+3. Restar ambos valores para conocer cuánto tiempo estuvo utilizando la CPU.
+4. Sumar ese resultado a su allotment acumulado.
+Esto permitiría medir el tiempo con mayor precisión que utilizando
+únicamente las interrupciones del reloj.
+
+4. ¿Qué observamos y qué suponemos?
+Aspecto                                                     Estado
+scheduler() entrega la CPU mediante swtch()                 Observado en el código
+sched() devuelve el control al planificador mediante swtch() Observado en el código
+yield() y sleep() utilizan el mecanismo de planificación    Observado en el código
+exit() también termina pasando por sched()                  Pendiente de comprobar directamente
+r_time() lee el contador de tiempo                          Observado en el código
+Podemos utilizar r_time() dentro de sched() para calcular
+el tiempo transcurrido                                      Hipótesis por comprobar
+
+5. Nuestra conclusión
+Creemos que utilizar scheduler() y sched() como puntos de referencia
+permitiría medir el tiempo real de CPU utilizado por cada proceso, incluyendo
+los casos en que se bloquea, cede voluntariamente la CPU o termina.
+Sin embargo, todavía necesitamos comprobar que exit() utiliza efectivamente
+sched() y que podemos consultar r_time() desde esos puntos del kernel.
+Una observación importante: no confundiríamos el tiempo transcurrido con el
+tiempo de CPU. Como medimos desde que el proceso comienza hasta que deja la
+CPU, el intervalo representa el tiempo durante el cual estuvo ejecutándose,
+sin incluir los periodos en los que permaneció bloqueado.
+
+
+----------------------------------------------------------------------
+[TUTOR]
+----------------------------------------------------------------------
+
+La tabla de observado y supuesto quedó muy clara, y la aclaración del final
+sobre tiempo transcurrido y tiempo de CPU es correcta. Les dejo dos notas
+para el reporte:
+
+- Al lado de exit() escribieron "la línea que esperamos encontrar". Hicieron
+  bien en marcarlo como pendiente. Mientras no la vean en su proc.c, no la
+  presenten como evidencia.
+- Pendiente de investigación: entre los dos swtch, el proceso también pasa
+  tiempo en el kernel, ya sea atendiendo sus propias llamadas al sistema o
+  interrupciones de dispositivos que no tienen nada que ver con él. ¿Ese
+  tiempo debería contar en su allotment? No hace falta resolverlo ahora, pero
+  anótenlo.
+
+Ahora volvamos a la Regla 1, que dice que un proceso de mayor prioridad
+"interrumpe inmediatamente" al que se está ejecutando. Comparen eso con lo
+que ustedes mismos anotaron sobre XV6:
+
+- "wakeup() pasa los procesos de SLEEPING a RUNNABLE."
+- "si which_dev == 2 se llama a yield()". O sea, el proceso que se está
+  ejecutando cede la CPU solo cuando llega una interrupción del reloj.
+
+Caso: con ticks de 5 ms, D (cola baja) se está ejecutando. Un milisegundo
+después del último tick, el usuario presiona una tecla. La interrupción del
+teclado termina llamando a wakeup(), y B (cola alta) pasa a RUNNABLE.
+
+Pregunta: Según la evidencia que tienen, ¿qué hace XV6 hoy en ese momento?
+¿Cuánto tiempo, como máximo, sigue ejecutándose D antes de que B pueda
+entrar? Con eso, decidan cuál es el comportamiento que realmente necesitan:
+
+- (a) mantener el "inmediatamente" de la Regla 1, y entonces explicar qué
+  tendría que pasar después de wakeup() para que D ceda la CPU; o
+- (b) relajar la regla a "en el siguiente tick", y entonces explicar qué
+  pierden con eso en relación con el problema que, según su punto 1,
+  resuelve MLFQ.
+
+Justifiquen la elección y separen lo observado de lo supuesto. Por ejemplo:
+¿han visto en trap.c qué valor tiene which_dev cuando la interrupción viene
+del teclado o de la consola?
+
+
+----------------------------------------------------------------------
+[ESTUDIANTES]
+----------------------------------------------------------------------
+
+En este caso encontramos una diferencia importante entre lo que queremos que
+haga nuestra variante de MLFQ y lo que actualmente hace XV6 con su
+planificador original.
+
+1. ¿Qué hace XV6 actualmente cuando B se despierta?
+Según lo que hemos revisado, cuando el usuario presiona una tecla ocurre lo
+siguiente:
+1. Se genera una interrupción del teclado.
+2. El kernel atiende esa interrupción.
+3. Se llama a wakeup() y B cambia de estado SLEEPING a RUNNABLE.
+4. D continúa ejecutándose porque todavía no ha llegado la siguiente
+   interrupción del reloj.
+Esto significa que XV6 no necesariamente interrumpe inmediatamente a D cuando
+B pasa a estar listo.
+
+2. ¿Cuánto tiempo puede continuar D ejecutándose?
+Si el reloj genera interrupciones cada 5 ms y la tecla se presiona 1 ms
+después del último tick, D podría continuar ejecutándose aproximadamente
+4 ms más antes de que llegue la siguiente interrupción del reloj.
+Ejemplo de la línea de tiempo
+    0 ms        1 ms                    5 ms
+    D ejecutándose antes de despertar B | D continúa mientras B espera
+Representación simplificada: B queda listo en el milisegundo 1 y D puede
+continuar hasta el siguiente tick, en el milisegundo 5.
+Por lo tanto, en este ejemplo D continúa aproximadamente 4 ms más.
+
+3. ¿Qué comportamiento elegiríamos?
+Elegiríamos la opción (a): mantener la interrupción inmediata.
+Nuestra razón es que uno de los objetivos principales de MLFQ es que los
+procesos interactivos respondan rápidamente. Si B tiene mayor prioridad que
+D, no nos parece conveniente obligarlo a esperar hasta la siguiente
+interrupción del reloj.
+Para conseguirlo, después de que wakeup() cambie el estado de B a RUNNABLE,
+el kernel tendría que comprobar si B tiene mayor prioridad que el proceso que
+está ejecutándose. Si es así, tendría que provocar que D ceda la CPU.
+Esto podría requerir que el proceso actual haga yield() después de terminar
+de atender la interrupción, siempre que sea seguro hacerlo.
+
+4. ¿Qué observamos y qué suponemos?
+Aspecto                                                      Estado
+wakeup() cambia procesos de SLEEPING a RUNNABLE              Observado en nuestro análisis
+El planificador original utiliza yield() cuando which_dev == 2 Observado en nuestro análisis
+El proceso actual puede continuar hasta el siguiente tick
+después de despertar B                                       Deducido del funcionamiento observado
+La interrupción del teclado tiene un valor específico de
+which_dev                                                    Pendiente de comprobar en trap.c
+Se puede implementar una cesión inmediata después de wakeup() Propuesta que debemos probar
+
+Todavía necesitamos revisar qué valor toma which_dev cuando la interrupción
+viene del teclado o de la consola. No debemos asumir que todas las
+interrupciones de dispositivos producen el mismo comportamiento.
+
+5. Nuestra conclusión
+Consideramos que mantener la interrupción inmediata es lo más adecuado para
+nuestra variante de MLFQ, porque permite que los procesos interactivos
+reciban atención rápidamente y evita que tengan que esperar innecesariamente
+a que termine el turno de un proceso de menor prioridad.
+Sin embargo, reconocemos que esto requiere modificar el comportamiento
+original de XV6, ya que actualmente el cambio de proceso por tiempo ocurre
+cuando llega la interrupción del reloj.
+Pendiente de investigación: comprobar en trap.c cómo se identifica la
+interrupción del teclado mediante which_dev y en qué punto sería seguro
+realizar un yield() después de wakeup().
+
+
+----------------------------------------------------------------------
+[TUTOR]
+----------------------------------------------------------------------
+
+Llegaron a una propuesta razonable. Antes de cerrarla, revisen dos cosas que
+el reporte tiene que reflejar:
+
+- ¿Dónde poner el yield? Su instinto de hacerlo "después de terminar de
+  atender la interrupción" va bien encaminado. Para justificarlo, piensen en
+  esto: wakeup() se llama desde muchos lugares del kernel, a veces mientras
+  se tienen locks tomados. Si D cediera la CPU dentro de wakeup(), ¿qué
+  podría pasar con esos locks? Anoten esa pregunta junto a su pendiente
+  sobre which_dev.
+- El costo de la opción (a). Con la opción (b), B esperaría como máximo un
+  tick, es decir, 5 ms. Comparen ese retraso con lo que una persona alcanza
+  a percibir al escribir en el teclado. Si la diferencia no se nota, ¿vale la
+  pena lo que cuesta la opción (a)? Pueden quedarse con (a), pero dejen
+  escrito el trade-off.
+
+Pasemos ahora al objetivo C: los escenarios de prueba. Ustedes ya tienen un
+buen candidato, porque en la conversación descubrieron que un proceso como G
+podría esquivar la Regla 4 si la contabilidad se hiciera por muestreo.
+
+Pregunta: Describan un escenario que permita comprobar, en una futura
+implementación, que la Regla 4 no se puede esquivar bloqueándose antes de
+cada tick. Para eso, indiquen:
+
+1. Qué procesos participan y qué hace cada uno. ¿Basta con G solo, o
+   necesitan un proceso de comparación?
+2. Qué regla o decisión comprueba, específicamente.
+3. Qué esperarían observar si la implementación es correcta y qué
+   observarían si no lo es. La diferencia tiene que poder verse.
+4. Cómo lo observarían. Su experimento con rrtest.c usaba impresiones en
+   pantalla. ¿Qué tendría que mostrar el kernel o el programa para saber en
+   qué cola está G en cada momento? ¿Eso ya existe en XV6 o habría que
+   agregarlo?
+
+Un detalle a tener en cuenta: un programa de usuario no controla exactamente
+cuándo llega el tick. ¿Cómo diseñarían a G para que el escenario funcione
+aunque no puedan garantizar la coincidencia que supusimos en la pregunta
+anterior?
+
+
+----------------------------------------------------------------------
+[ESTUDIANTES] – Archivo adjunto: Escenario G/H
+----------------------------------------------------------------------
+
+Para comprobar que la Regla 4 no se puede esquivar bloqueándose antes de cada
+tick, propondríamos hacer una prueba con dos procesos: G y H. La idea es
+comparar el comportamiento de un proceso que se bloquea frecuentemente con
+otro que consume CPU de manera continua.
+
+1. Procesos que participan
+- Proceso G: ejecuta durante intervalos cortos y después se bloquea
+  voluntariamente durante un tiempo. Repite este comportamiento para intentar
+  evitar que los ticks lo encuentren ejecutándose.
+- Proceso H: consume CPU continuamente, sin bloquearse voluntariamente. Nos
+  sirve como referencia para comparar el comportamiento de un proceso que sí
+  utiliza su tiempo de CPU de forma constante.
+No sería suficiente utilizar únicamente G, porque necesitamos una referencia
+que nos ayude a identificar si la contabilidad de CPU está funcionando
+correctamente.
+
+2. ¿Qué regla estamos comprobando?
+Estamos comprobando la Regla 4, que establece que un proceso debe bajar de
+prioridad cuando consume el allotment acumulado de su cola, aunque se haya
+bloqueado varias veces durante su ejecución.
+En nuestro caso, G no debería evitar la degradación de prioridad simplemente
+bloqueándose antes de que llegue una interrupción del reloj.
+También estamos comprobando nuestra decisión de contabilizar el tiempo real
+de CPU utilizado, en lugar de depender únicamente de los ticks.
+
+3. ¿Qué esperamos observar?
+Suponiendo que G comienza en la cola alta, cuyo allotment es de 10 ms:
+Implementación correcta                       | Implementación incorrecta
+G acumula el tiempo que realmente utiliza la  | G solamente acumula tiempo cuando coincide
+CPU.                                          | con un tick mientras está ejecutándose.
+Al alcanzar 10 ms de CPU acumulados, G baja a | G podría permanecer indefinidamente en la
+la cola media.                                | cola alta si consigue bloquearse antes de
+                                              | cada tick.
+Los bloqueos no reinician su allotment.       | Los bloqueos podrían impedir que se
+                                              | complete el allotment.
+
+La diferencia que buscamos es que G debe terminar bajando de prioridad
+después de consumir sus 10 ms de CPU, independientemente de cuántas veces se
+haya bloqueado.
+
+4. ¿Cómo observaríamos los resultados?
+Nuestro programa rrtest.c utilizaba impresiones en pantalla, pero eso no es
+suficiente para esta prueba. Necesitamos conocer el estado interno del
+planificador.
+Por eso, propondríamos agregar información de depuración al kernel para
+mostrar:
+- PID del proceso.
+- Cola en la que se encuentra.
+- Tiempo de CPU acumulado en esa cola.
+- Allotment restante.
+- Momento en que ocurre una promoción o degradación.
+Por ejemplo, podríamos obtener una salida similar a esta:
+    PID  G | Cola: Alta  | CPU acumulada: 4 ms  | Allotment: 6 ms
+    PID  G | Cola: Alta  | CPU acumulada: 8 ms  | Allotment: 2 ms
+    PID  G | Cola: Media | CPU acumulada: 10 ms | Degradación realizada
+Esta información no existe necesariamente en el XV6 original. Tendríamos que
+agregarla como parte de nuestra implementación, mediante impresiones de
+depuración o alguna interfaz que permita consultar el estado de los
+procesos.
+
+5. ¿Cómo evitar depender de la coincidencia exacta con los ticks?
+No podemos garantizar que G se bloquee exactamente antes de cada
+interrupción del reloj, porque un programa de usuario no controla cuándo
+llegan los ticks.
+Para solucionar esto, haríamos que G repita muchas veces un ciclo de
+ejecución y bloqueo:
+1. Ejecutar una pequeña cantidad de instrucciones.
+2. Bloquearse durante un intervalo corto.
+3. Despertarse y volver a ejecutar.
+4. Repetir el ciclo hasta superar ampliamente los 10 ms de CPU acumulados.
+Así, aunque algunas veces G coincida con una interrupción del reloj mientras
+está ejecutándose, la prueba sigue siendo útil. Lo importante es que acumule
+suficiente tiempo de CPU mediante muchos intervalos pequeños.
+Además, podríamos repetir la prueba varias veces para reducir la posibilidad
+de que el resultado dependa de una coincidencia particular con los ticks.
+
+Conclusión para el reporte
+Con este escenario buscamos comprobar que la degradación de prioridad depende
+del tiempo de CPU realmente consumido y no de la cantidad de interrupciones
+del reloj que encuentra al proceso ejecutándose. Si la implementación es
+correcta, G debe pasar de la cola alta a la media al acumular los 10 ms de
+allotment, aunque se haya bloqueado repetidamente. Para comprobarlo,
+necesitaremos agregar información de depuración al kernel que permita
+observar la cola y el tiempo acumulado de cada proceso.
+
+Dos pendientes que conviene conservar de la discusión anterior:
+- No colocar yield() dentro de wakeup() sin analizar los locks que podrían
+  estar tomados. Hay que estudiar un punto seguro después de atender la
+  interrupción.
+- Comparar el beneficio de la opción (a) con su costo: la opción (b) puede
+  introducir hasta 5 ms de espera, mientras que la opción (a) requiere
+  modificar el flujo de interrupciones y planificación.
+
+
+----------------------------------------------------------------------
+[TUTOR]
+----------------------------------------------------------------------
+
+El diseño mejoró bastante. Repetir muchos ciclos cortos resuelve el problema
+de que G no controla cuándo llega el tick, y queda bien explicado por qué
+hacen falta datos de depuración del kernel. Los dos pendientes quedaron
+registrados correctamente.
+
+Ahora le veo dos problemas al escenario: uno de lógica y otro de diseño.
+
+1. Circularidad. La salida que proponen ("CPU acumulada: 10 ms →
+   degradación") la calcula el mismo mecanismo que quieren poner a prueba.
+   Si la contabilidad está mal, ese número también va a estar mal, y la
+   salida puede verse perfectamente coherente. Además, una implementación
+   por muestreo también termina degradando a G alguna vez, cuando un tick por
+   fin lo encuentre ejecutándose. Por eso, que G "baje a la cola media" no
+   alcanza para distinguir una implementación correcta de una incorrecta.
+2. El papel de H. Dicen que H es la referencia, pero en la tabla de
+   resultados esperados H no aparece. ¿Qué se compara de H con G,
+   exactamente?
+
+Pregunta: ¿Qué medida independiente de la contabilidad del kernel usarían
+para saber cuánta CPU consumió G en realidad antes de bajar de cola? ¿Y cómo
+los ayuda H a obtener esa medida o a validarla? Con esa medida, reescriban el
+criterio de éxito en términos cuantitativos: "la implementación es correcta
+si G baja cuando su CPU real está cerca de ___; es incorrecta si ___".
+
+Pista: piensen en algo que el propio programa G pueda contar sin preguntarle
+nada al planificador. Piensen también en qué ventaja tiene H, que nunca se
+bloquea, para calibrar esa cuenta.
+
+
+----------------------------------------------------------------------
+[ESTUDIANTES]
+----------------------------------------------------------------------
+
+1. Medida independiente (lo que G puede contar por su cuenta): Para no
+depender de los números que imprime el mismo kernel (que podrían estar mal
+calculados), podemos hacer que el propio programa G cuente cuántas
+iteraciones de un ciclo o cuántas operaciones matemáticas logra hacer antes
+de que lo bajen de cola (por ejemplo, incrementar un contador en un bucle
+while entre cada pausa o llamada de I/O). Como el contador vive en la memoria
+de G y lo suma la CPU cada vez que G realmente está ejecutándose, ese número
+refleja el trabajo real que hizo G, sin importar lo que diga el planificador.
+
+2. ¿Para qué nos sirve H en esto? (Calibración): Como H es un proceso 100 %
+intensivo de CPU que nunca se bloquea ni hace pausas, si le ponemos
+exactamente el mismo bucle contador que a G, H nos sirve como "regla" o punto
+de referencia. Sabemos que H va a gastar su allotment de golpe y sin
+interrupciones, así que el número de iteraciones que H alcanza a hacer antes
+de bajar de cola equivale exactamente a 1 allotment real de CPU (por
+ejemplo, si el allotment es de 10 ms y H logra hacer 500.000 iteraciones
+antes de bajar, ya sabemos que 10 ms de CPU real equivalen más o menos a
+500.000 iteraciones en esa máquina).
+
+3. Criterio de éxito reescrito: Con eso en mente, nuestro criterio quedaría
+así:
+"La implementación es correcta si G baja de cola cuando su contador interno
+de iteraciones está cerca de las iteraciones totales que logró H antes de
+degradarse (con un pequeño margen de error por el costo de entrar y salir de
+las pausas de I/O); es incorrecta si G logra hacer muchas más iteraciones que
+H (por ejemplo, el doble o el triple) antes de bajar de cola, o si nunca
+baja, ya que eso demostraría que el kernel está reiniciando su tiempo cada
+vez que G suelta la CPU."
+
+
+----------------------------------------------------------------------
+[TUTOR]
+----------------------------------------------------------------------
+
+El criterio quedó cuantitativo y verificable, y la idea de calibrar con H
+está bien pensada. Antes de pasarlo al reporte, revisen tres detalles:
+
+- ¿Por qué se puede confiar en H? H también "baja de cola" porque se lo dice
+  el kernel. Expliquen por qué, en el caso de H, una contabilidad correcta y
+  una contabilidad por muestreo darían el mismo resultado. Ahí está la razón
+  por la que H sirve como regla de medición y G no.
+- La causa del fallo. En el escenario incorrecto, el kernel no estaría
+  "reiniciando el tiempo de G cada vez que suelta la CPU". Lo que pasaría es
+  que el tiempo de G no se registra cuando ningún tick lo encuentra
+  ejecutándose. Corrijan esa frase.
+- Cómo relacionar las dos medidas. El contador vive en G y el aviso de
+  degradación lo da el kernel. ¿Cómo sabrán cuánto valía el contador de G en
+  el momento en que el kernel lo bajó de cola? Basta con que lo anoten como
+  algo a resolver en el diseño de la prueba.
+
+Para completar el objetivo C, falta comprobar con escenarios otras dos partes
+de su variante, que hasta ahora no tienen ninguno:
+
+Pregunta: Describan dos escenarios más, con el mismo formato de cuatro partes
+(procesos, regla, resultado esperado correcto e incorrecto, y forma de
+observarlo):
+
+1. Uno que compruebe la Regla 5 (boost), es decir, que un proceso de la cola
+   baja no se queda sin CPU para siempre. ¿Qué tienen que hacer los demás
+   procesos para que, sin boost, ese proceso de verdad se quede sin CPU?
+2. Uno que compruebe la Regla 1 con la opción (a), es decir, que un proceso
+   interactivo que se despierta interrumpe de inmediato a uno de una cola
+   inferior. ¿Qué medirían para distinguir "inmediatamente" de "en el
+   siguiente tick", si la diferencia es de unos pocos ms?
+
+No hace falta que sean tan detallados como el de G. Lo importante es que en
+cada uno quede clara una diferencia observable entre una implementación que
+cumple la regla y una que no.
+
+
+----------------------------------------------------------------------
+[ESTUDIANTES]
+----------------------------------------------------------------------
+
+Correcciones al escenario de G y H
+
+* ¿Por qué sí podemos confiar en H como regla de medición? Porque H nunca
+  suelta la CPU voluntariamente. Como está corriendo de seguido todo el
+  tiempo, cuando llega el tick del reloj siempre va a encontrar a H
+  ejecutándose. Así que, tanto si el kernel lleva la cuenta exacta como si
+  solo mide por muestreo en cada tick, H va a ser detectado en todos los
+  ticks hasta gastar su allotment. Por eso ambos métodos dan prácticamente el
+  mismo número de iteraciones para H, lo que nos sirve de referencia fiable.
+* Corrección en el criterio de éxito:
+  "La implementación es correcta si G baja de cola cuando su contador
+  interno de iteraciones está cerca de las iteraciones totales que logró H
+  antes de degradarse (con un pequeño margen por las llamadas al sistema); es
+  incorrecta si G logra hacer muchas más iteraciones que H (por ejemplo, el
+  doble o el triple) antes de bajar, o si nunca baja, ya que eso demostraría
+  que el tiempo de G no se está registrando cuando ningún tick lo encuentra
+  ejecutándose."
+* Pendiente por resolver en el diseño: Queda pendiente definir cómo vamos a
+  capturar el valor exacto del contador de G en el instante en que el kernel
+  lo baja de cola (por ejemplo, pasando la dirección del contador al kernel
+  para que lo lea al degradarlo, o haciendo que G consulte su prioridad
+  actual en cada ciclo hasta notar que cambió).
+
+Escenario 2: Comprobación de la Regla 5 (Priority Boost)
+* Procesos:
+  * L (Largo): Un proceso pesado de puro cálculo que arranca primero, gasta
+    su tiempo y cae hasta la cola más baja.
+  * I1 e I2 (Interactivos constantes): Dos procesos que entran después,
+    hacen ráfagas cortas de CPU y se bloquean alternándose todo el tiempo, de
+    modo que siempre haya al menos uno listo en la cola alta.
+* Regla que comprueba: Regla 5 (cada período S, todos los procesos suben a la
+  cola de mayor prioridad para evitar la hambruna).
+* Resultado esperado:
+  * Correcto: Aunque I1 e I2 nunca dejan vacía la cola alta, al cumplirse el
+    tiempo S, el proceso L sube a la cola alta y logra ejecutarse y avanzar
+    en su contador/cálculo.
+  * Incorrecto: L se queda atrapado en la cola baja con su contador congelado
+    indefinidamente mientras I1 e I2 se reparten toda la CPU.
+* Forma de observarlo: Poner un contador de iteraciones en L y registrar
+  marcas de tiempo cada vez que logre avanzar. Si el boost funciona, veremos
+  saltos periódicos en el progreso de L cada S milisegundos; si falla, L no
+  avanzará nada después de caer a la cola baja.
+
+Escenario 3: Comprobación de la Regla 1 con expropiación inmediata (Opción a)
+* Procesos:
+  * B (Bajo): Un proceso pesado que ya gastó su allotment y está
+    ejecutándose en la cola baja.
+  * A (Interactivo / Alta): Un proceso que está en la cola alta, pero
+    bloqueado esperando un evento externo (por ejemplo, un temporizador o una
+    señal) mientras B usa la CPU.
+* Regla que comprueba: Regla 1 con opción (a) (si un proceso de mayor
+  prioridad pasa a estado listo, expropia de inmediato al de menor prioridad
+  sin esperar al siguiente tick).
+* Resultado esperado:
+  * Correcto: En el instante en que ocurre el evento que despierta a A, B es
+    expulsado de la CPU de inmediato y A empieza a correr casi sin retraso
+    (menos de 1 ms, solo lo que tarde el cambio de contexto).
+  * Incorrecto: A se queda esperando a que termine el quantum actual de B o a
+    que llegue la siguiente interrupción de reloj (tick), retrasando su
+    arranque varios milisegundos.
+* Forma de observarlo: Medir con un reloj de alta resolución (o contador de
+  ciclos de hardware como rdtsc) la latencia entre el instante en que se
+  envía la señal/evento para despertar a A y la primera instrucción que A
+  ejecuta al despertar. Si el tiempo es cercano a 0 ms (microsegundos), hubo
+  expropiación inmediata; si ronda el tamaño de un tick (ej. 5 a 10 ms), el
+  planificador esperó al reloj.
+
+
+----------------------------------------------------------------------
+[TUTOR]
+----------------------------------------------------------------------
+
+Las correcciones del escenario G/H quedaron bien. Antes de pasar los otros
+dos escenarios al reporte, el 3 necesita tres ajustes. Pueden resolverlos por
+su cuenta:
+
+- rdtsc es una instrucción de x86, no de RISC-V. ¿Qué usarían en su lugar?
+  Ya vieron r_time() en el kernel. Si un programa de usuario puede leer ese
+  contador por su cuenta, para ustedes eso es todavía una hipótesis por
+  comprobar.
+- El evento que despierta al proceso de mayor prioridad. Si es un
+  temporizador, por ejemplo un sleep() de usuario, piensen en quién lo
+  despierta en XV6. Si quien lo despierta es la interrupción del reloj, la
+  despertada siempre coincide con un tick, y entonces "inmediatamente" y "en
+  el siguiente tick" darían el mismo resultado. ¿Qué fuente de despertar no
+  está atada al tick? ¿Y quién registraría el instante en que ocurre?
+- Nombres repetidos. En toda la conversación "B" fue el proceso interactivo,
+  y aquí es el pesado. Cámbienle el nombre para que el reporte no se
+  contradiga.
+
+Ahora el escenario 2, que tiene un problema conceptual. Revísenlo con su
+propia Regla 4.
+
+Pregunta: I1 e I2 hacen ráfagas cortas de CPU y se van turnando para que la
+cola alta nunca quede vacía. Según la Regla 4, ¿qué les pasa a I1 e I2
+después de acumular 10 ms de CPU cada uno? ¿Siguen en la cola alta? Y si se
+bloquean tan seguido que casi no acumulan CPU, ¿quién usa la CPU mientras los
+dos están bloqueados?
+
+Con esas respuestas, expliquen si este escenario sin boost dejaría de verdad
+sin CPU a L. Si no lo hace, propongan qué tendrían que hacer los procesos de
+prioridad alta para lograrlo, considerando que la Regla 4 los va bajando de
+cola. Pista: piensen en la Regla 3. ¿Qué tipo de proceso entra siempre con
+allotment completo en la cola alta?
+
+
+----------------------------------------------------------------------
+[ESTUDIANTES]
+----------------------------------------------------------------------
+
+Ajustes al Escenario 3 (Regla 1a - Expropiación Inmediata)
+
+* ¿Cómo medir el tiempo en RISC-V desde usuario (nuestra hipótesis): Como
+  rdtsc es de x86, para RISC-V (que es la arquitectura que usamos con xv6)
+  tendríamos que leer el contador de ciclos de hardware. Si el kernel nos
+  deja, la idea sería leer el registro mcycle o time directamente desde el
+  proceso de usuario (como hipótesis, tendríamos que ver si xv6 nos permite
+  hacerlo sin llamar al sistema). Si no se puede, nos tocaría agregar una
+  system call chiquita solo para que nos devuelva ese valor de alta
+  precisión.
+* El evento para despertar a A sin depender del tick: Tienes toda la razón:
+  si usamos un sleep(), eso se procesa en las interrupciones del reloj, así
+  que despertar a A y el tick pasarían al mismo tiempo y no podríamos medir
+  la diferencia. Para que el evento sea asíncrono (que pase en cualquier
+  momento), podemos usar la llegada de un carácter desde el teclado (UART).
+  El kernel registra el momento exacto (con el contador de ciclos) en que
+  ocurre la interrupción del teclado en su manejador (uartintr), y A (que
+  estaba bloqueado en un read() del teclado) toma el tiempo apenas despierta
+  en modo usuario.
+* Cambio de nombres: Para no contradecir el resto del reporte, vamos a llamar
+  P (Pesado) al proceso de la cola baja y mantenemos a A (Alta/Interactivo).
+
+Escenario 3 corregido:
+Procesos: P (Pesado, en cola baja) y A (Interactivo, bloqueado esperando el
+teclado en cola alta). Regla: Regla 1 opción (a) (A debe expropiar a P
+inmediatamente al despertar). Resultado esperado y cómo medirlo: Presionamos
+una tecla. El manejador de interrupción del teclado en el kernel anota el
+tiempo T1. Cuando A se despierta y retoma su read(), anota el tiempo T2. Si
+T2 - T1 es súper corto (solo el costo del cambio de contexto), funciona la
+expropiación inmediata. Si se demora varios milisegundos, el planificador se
+quedó esperando al siguiente tick.
+
+El problema conceptual del Escenario 2 (Regla 5 - Boost)
+Al revisar nuestra propia Regla 4 ("baja de nivel al agotar el allotment
+acumulado"), nos dimos cuenta de que la idea original con I1 e I2 no
+funciona:
+
+1. Si I1 e I2 hacen ráfagas cortas pero continuas, sus milisegundos se van a
+   ir sumando. Apenas cada uno acumule su allotment (ej. 10 ms), la Regla 4
+   los va a patear a una cola más baja, igualito que le pasó a L, sin
+   importar cuántas veces se hayan bloqueado entre ráfagas.
+2. Si los ponemos a bloquearse durante mucho tiempo para que no consuman su
+   allotment, entonces mientras están dormidos la cola alta va a quedar
+   vacía, ¡y L podría usar la CPU! O sea, no lo estaríamos privando de CPU
+   (no habría starvation).
+
+¿Cómo dejamos a L sin CPU de verdad si la Regla 4 nos tumba todo a la cola
+media? La pista está en la Regla 3: "Un proceso nuevo entra en la cola de
+mayor prioridad". El único proceso que tiene su allotment nuevecito e intacto
+en la cola alta es un proceso recién nacido.
+
+Escenario 2 corregido: Para matar de hambre a L sin usar el boost,
+necesitamos un programa atacante K (Kamikaze) en la cola alta que se dedique
+a gastar casi todo su allotment (ej. 9 ms) y, justo antes de que lo bajen,
+cree un proceso hijo (un clon) mediante fork() y el padre se muera (exit()).
+El hijo nace nuevo en la cola VIP (Regla 3) con sus 10 ms de allotment
+completos, gasta 9 ms, crea otro hijo y se muere. Así armamos una cadena
+infinita de hijos kamikazes que siempre acaparan la cola alta.
+
+* Resultado esperado (con Boost activado): Aunque los kamikazes intenten
+  acaparar la cola VIP haciendo relevos, cada S milisegundos se activa el
+  boost. L sube a la cola alta y el kernel lo hace competir de tú a tú
+  (Round Robin, Regla 2) con el kamikaze de turno. Así comprobamos que L sí
+  logra avanzar y salir de la hambruna gracias al boost.
+
+
+----------------------------------------------------------------------
+[TUTOR]
+----------------------------------------------------------------------
+
+Muy bien. El escenario 2 corregido funciona y además deja ver algo que su
+variante todavía no resuelve. Antes de cerrar, anoten estos tres puntos:
+
+- Falta el resultado "incorrecto" del escenario 2. Si el boost no funciona,
+  ¿qué mostraría el contador de L?
+- Otro pendiente que revela K. Incluso con el boost, la cadena de fork() le
+  da a K un allotment nuevo en cada generación. La Regla 3 no dice si un
+  hijo hereda la contabilidad de su padre. ¿Deberían hacerlo? Anótenlo como
+  cuestión abierta de su variante, no de XV6.
+- En el escenario 3 nombran uartintr. ¿Lo vieron en su código o lo suponen?
+  También falta comprobar en qué función se llama de verdad a wakeup() para
+  el proceso que está bloqueado en read(). Márquenlo según lo que hayan
+  visto.
+
+Con eso ya tienen el material de los tres objetivos. Les toca cerrar.
+
+Pregunta: Redacten sus conclusiones. No hace falta que repitan todo; basta
+con que se entiendan estas cuatro partes:
+
+1. Variante final (A): las reglas y decisiones que la definen, en pocas
+   líneas.
+2. Cambios que necesitaría XV6 (B): para cada uno, qué propósito tiene, qué
+   regla o decisión respalda y qué evidencia del código lo justifica.
+   Indiquen si esa evidencia está observada o es hipótesis. Esta no es una
+   lista de archivos que modificar, sino de necesidades. Por ejemplo, "medir
+   el uso real de CPU porque…".
+3. Escenarios (C): una línea por escenario que diga qué regla comprueba y
+   cuál es la diferencia observable.
+4. Pendientes de investigación: todo lo que fueron anotando en la
+   conversación.
+
+Cuando la tengan, les haré una última pregunta sobre un caso concreto para
+comprobar que todo encaja.
+
+
+----------------------------------------------------------------------
+[ESTUDIANTES]
+----------------------------------------------------------------------
+
+Aquí están nuestras conclusiones del trabajo, ya organizadas y sumando los
+ajustes que nos faltaban (el resultado incorrecto de L, la duda del fork y lo
+del teclado en xv6).
+
+1. Variante final (A) Diseñamos un MLFQ de 3 colas basado en las 5 reglas de
+OSTEP. Las decisiones clave son: la Regla 4 es estricta (el tiempo de CPU
+allotment se acumula sin importar si el proceso hace pausas de I/O, para
+evitar que hagan trampa), incluimos un boost global cada cierto tiempo S
+(Regla 5) para evitar la hambruna, y aplicamos la expropiación inmediata
+(Regla 1a) para que los procesos interactivos no tengan que esperar al
+siguiente tick del reloj al despertar.
+
+2. Cambios que necesitaría XV6 (B)
+* Contabilidad acumulativa y prioridades: Necesitamos que xv6 mida el uso
+  real de CPU y recuerde la prioridad y el allotment consumido de cada
+  proceso. Propósito: Respaldar las reglas 1, 2, 3 y 4. Evidencia: Observamos
+  que la estructura struct proc actualmente no tiene variables para
+  prioridad ni historial de tiempo acumulado.
+* Mecanismo global de Boost: Necesitamos un contador global en el kernel que
+  lleve el tiempo S. Propósito: Respaldar la Regla 5. Evidencia: Hipótesis
+  basada en que actualmente el planificador solo evalúa procesos en cada
+  interrupción del reloj, pero no hace acciones masivas de reinicio de
+  estado.
+* Expropiación asíncrona al despertar: Modificar el flujo de despertar
+  procesos para que expulse a la CPU actual si el que despierta tiene mayor
+  prioridad. Propósito: Respaldar la Regla 1a. Evidencia: Hipótesis; creemos
+  que el planificador actual solo hace yield() (ceder la CPU) forzado cuando
+  ocurre un tick del temporizador.
+
+3. Escenarios (C)
+* Escenario G/H (Regla 4 - Acumulación): Comprueba que G no engaña al sistema
+  con pausas. Diferencia observable: Correcto si G baja de cola haciendo casi
+  las mismas iteraciones que el proceso pesado H; incorrecto si G hace
+  muchísimas más iteraciones que H antes de bajar (o nunca baja).
+* Escenario Kamikazes (Regla 5 - Boost): Comprueba que el proceso pesado L no
+  sufre hambruna por culpa de procesos nuevos continuos. Diferencia
+  observable: Correcto si el contador de L logra avanzar periódicamente
+  gracias al boost; incorrecto si el contador de L se queda congelado
+  indefinidamente en cero.
+* Escenario Teclado (Regla 1a - Expropiación inmediata): Comprueba que un
+  proceso interactivo reacciona al instante. Diferencia observable: Correcto
+  si la latencia entre el evento y la reacción de A es de microsegundos;
+  incorrecto si tarda varios milisegundos por quedarse esperando al
+  siguiente tick.
+
+4. Pendientes de investigación
+* La herencia en el fork() (Duda de nuestra variante): El escenario de los
+  kamikazes reveló un hueco lógico en las reglas: ¿Un hijo debería nacer en
+  la cola VIP (Regla 3) o debería heredar la contabilidad y prioridad de su
+  padre? Si no la hereda, la Regla 3 facilita una nueva forma de hacer
+  trampa.
+* Sincronización del contador de G: Tenemos que diseñar cómo hacer que el
+  kernel y el proceso G sincronicen el valor exacto de las iteraciones justo
+  en el instante en que el kernel decide bajarlo de cola.
+* Lectura del reloj en RISC-V: Tenemos la hipótesis de que un programa de
+  usuario puede leer el registro de hardware (time o mcycle) directamente.
+  Si xv6 lo prohíbe, nos tocará programar una system call nueva solo para
+  esta medición de alta precisión.
+* Eventos asíncronos en el código de xv6: Para el escenario 3, nombramos
+  uartintr como el lugar donde se captura el teclado, pero es una
+  suposición. Tenemos pendiente revisar el código real para confirmar si es
+  ahí, y para encontrar exactamente en qué función el kernel llama a
+  wakeup() cuando se completa un read() del teclado.
+
+Estamos listos para esa última pregunta del caso concreto a ver si todo
+encaja.
+
+
+----------------------------------------------------------------------
+[TUTOR]
+----------------------------------------------------------------------
+
+Las conclusiones ya tienen la forma correcta. Antes de la pregunta final,
+revisen estas inconsistencias con lo que ustedes mismos establecieron en la
+conversación. No las voy a corregir por ustedes:
+
+- Parte 1: quedaron fuera las Decisiones 1 a 5, el comportamiento al
+  bloquearse y los parámetros, incluida la cola baja sin allotment. Así como
+  está, otra persona no podría reconstruir su variante. Además, dicen
+  "basado en OSTEP", pero en la conversación nunca citaron esa fuente. Si la
+  usaron, pónganla en la bibliografía.
+- Parte 2, cambios que faltan: el cambio de frecuencia del reloj a ticks de
+  5 ms no aparece, y fue el primer problema que encontraron. Tampoco citan la
+  evidencia que sí tenían para la medición: los dos swtch (líneas 453 y 495)
+  y r_time().
+- Parte 2, etiquetas de evidencia: la expropiación aparece como "hipótesis",
+  pero ustedes observaron que yield() se llama cuando which_dev == 2. En
+  cambio, lo de "struct proc no tiene variables de prioridad" aparece como
+  observado. ¿Lo revisaron completo, o solo vieron el campo state?
+- Parte 3, escenario de L: L sí corrió antes de bajar de cola, así que su
+  contador no se queda "en cero". Lo que pasa es que deja de avanzar.
+- Parte 4: se perdieron varios pendientes. Por ejemplo, confirmar el
+  comentario de la línea 179 (los 100 ms siguen siendo hipótesis), confirmar
+  que exit() llama a sched(), ver qué otras partes del kernel dependen del
+  tick (sleep(10)), decidir si el tiempo que se pasa en el kernel cuenta en
+  el allotment, decidir dónde es seguro llamar a yield() sin tener locks
+  tomados y comparar costo y beneficio de (a) frente a (b). Revisen la
+  conversación y recupérenlos.
+
+Pregunta final, el caso concreto. Supongan su variante implementada con todos
+los cambios de la parte B y ticks cada 5 ms (en t = 0, 5, 10, 15…).
+
+- X está en la cola media: lleva 7 ms de allotment acumulado, le quedan 3 ms
+  de quantum y empieza a ejecutarse en t = 0.
+- Y está en la cola media, esperando: 0 ms de allotment acumulado y quantum
+  completo.
+- A está en la cola alta y bloqueado esperando el teclado. En t = 1 llega una
+  tecla; A se ejecuta 1 ms y vuelve a bloquearse.
+
+Hagan la línea de tiempo hasta que X salga de la cola media. En cada tramo,
+digan quién se ejecuta y qué regla o decisión se aplica. Después respondan:
+¿en qué instantes exactos deberían bajar de cola Y y X según la Decisión 1?
+¿Alguno de esos instantes coincide con un tick? Si no coincide, ¿qué
+mecanismo de su parte B hace que el kernel actúe justo en ese momento? Si
+ninguno lo hace, ¿qué dice eso de la coherencia entre la Decisión 1 y los
+cambios que propusieron, y qué tendrían que agregar a la parte B, quitar o
+relajar en la Decisión 1?
+
+
+----------------------------------------------------------------------
+[ESTUDIANTES]
+----------------------------------------------------------------------
+
+Uf, muchísimas gracias por la revisión tan minuciosa. Tienes toda la razón,
+se nos habían quedado varias cosas en el aire que habíamos discutido antes.
+Ya actualizamos el documento final para incluir las Decisiones 1 a 5
+explícitamente, los parámetros correctos (incluyendo la cola baja sin
+allotment), la cita de OSTEP en la bibliografía, la reducción de ticks a
+5 ms, y la evidencia correcta (swtch, r_time(), y que yield() con
+which_dev == 2 sí es algo observado). También corregimos que el contador de L
+"deja de avanzar" (no que se queda en cero) y recuperamos nuestra lista
+completa de pendientes técnicos (los 100 ms, exit() llamando a sched(), los
+sleep(), locks en yield(), el tiempo en kernel, etc.).
+Con el documento ya cuadrado, aquí va la resolución del caso concreto, que
+nos voló la cabeza porque deja ver un error grave en nuestro propio diseño:
+
+Línea de tiempo del caso concreto
+* t = 0: X (cola media) empieza a ejecutarse. Entró con 7 ms acumulados y le
+  quedan 3 ms de quantum. (Regla 2: Round Robin / elección de proceso).
+* t = 1: Llega la tecla. El hardware despierta a A (cola alta). Por nuestra
+  Regla 1 opción (a) (expropiación inmediata), A interrumpe a X en el acto,
+  sin esperar al tick.
+  * Estado de X: Alcanzó a correr 1 ms. Su allotment acumulado sube a 8 ms y
+    le quedan 2 ms de quantum.
+* t = 1 a t = 2: A se ejecuta durante 1 ms y vuelve a bloquearse. (Regla 1:
+  mayor prioridad).
+* t = 2: Como A se bloqueó y la cola alta está vacía, el planificador le
+  devuelve la CPU a X en la cola media para que termine lo que le faltaba.
+* t = 2 a t = 4: X se ejecuta los 2 ms que le quedaban. En t = 4, X completa
+  su allotment (8 ms + 2 ms = 10 ms) y agota su quantum al mismo tiempo.
+  (Regla 4).
+* t = 4: X baja a la cola baja. Inicia el turno de Y en la cola media.
+* t = 4 a t = 14: Y se ejecuta. Luego de 10 ms de uso continuo, en t = 14, Y
+  completa su propio allotment y agota su quantum, debiendo bajar a la cola
+  baja.
+
+Análisis de la inconsistencia
+¿En qué instantes exactos deberían bajar de cola X y Y según la Decisión 1?
+X debería bajar exactamente en t = 4 y Y debería bajar exactamente en t = 14.
+¿Coincide alguno de esos instantes con un tick? No. Los ticks del hardware
+ocurren cada 5 ms, es decir, en t = 0, 5, 10, 15, etc.
+¿Qué mecanismo de la Parte B hace que el kernel actúe justo en ese
+momento? ¡Ninguno! Y ahí está la trampa. Nuestra Parte B proponía medir el
+tiempo exacto con r_time() y expropiar al despertar, pero no propusimos nada
+para interrumpir a un proceso que está calculando entre un tick y otro. Si el
+planificador solo se invoca en los ticks de reloj, en t = 4 nadie en el
+kernel se va a dar cuenta de que X agotó su allotment. X seguiría corriendo
+hasta el tick en t = 5 (acumulando 11 ms en total), y Y seguiría hasta el
+tick en t = 15 (acumulando 11 ms también).
+¿Qué dice esto de la coherencia y cómo lo solucionamos? Demuestra que una
+contabilidad estricta y perfecta (Decisión 1) es físicamente incompatible con
+un kernel impulsado por un temporizador de ticks fijos.
+Para arreglar esta contradicción, tenemos dos caminos:
+1. Agregar a la Parte B (Hardware/Kernel): Tendríamos que exigir un
+   temporizador de alta resolución programable (dinámico). En cada cambio de
+   contexto, el planificador tendría que programar la interrupción para que
+   suene exactamente en los milisegundos que le faltan al proceso (por
+   ejemplo, al retomar a X en t = 2, el kernel programaría el temporizador
+   para que interrumpa en 2 ms).
+2. Relajar la Decisión 1 (Variante): Si mantenemos los ticks fijos de xv6,
+   tenemos que admitir que la degradación será por muestreo retrasado. Es
+   decir, aceptar que X baje de cola en t = 5 con 11 ms de CPU consumida, y
+   simplemente descontarle o penalizarle ese milisegundo extra en la
+   contabilidad de su siguiente nivel inferior.
+
+¿Qué te parece? ¡Nos dimos cuenta de que estábamos pidiendo reglas
+matemáticas perfectas sobre un reloj que funciona a saltos!
+
+
+----------------------------------------------------------------------
+[TUTOR]
+----------------------------------------------------------------------
+
+Encontraron la inconsistencia principal: con reglas exactas al milisegundo y
+un kernel que solo actúa en cada tick, la Decisión 1 no se puede cumplir.
+Pero antes de dar por buena la línea de tiempo, revísenla contra su propio
+documento.
+
+Revisen t = 2 con la Decisión 4. Escribieron que cuando A se bloquea, el
+planificador "le devuelve la CPU a X para que termine lo que le faltaba".
+Pero la Decisión 4 dice que un proceso interrumpido por otro de mayor
+prioridad conserva su quantum y pasa al final de su cola. ¿Quién estaba en la
+cola media cuando A interrumpió a X? Rehagan la línea de tiempo desde t = 2 y
+calculen de nuevo los instantes exactos en que bajan Y y X. Su conclusión
+general probablemente no cambie, pero los números sí. Esta misma decisión ya
+la habían cambiado una vez en la conversación, así que es justo el tipo de
+inconsistencia que esta pregunta busca detectar.
+
+Sobre las dos salidas que proponen:
+
+- Camino 1: vuelvan a mirar la línea que ustedes mismos copiaron de trap.c:
+  w_stimecmp(r_time() + 1000000). ¿Ese intervalo de 1.000.000 lo fija el
+  hardware o lo escribe el kernel cada vez? Si es lo segundo, quizá no estén
+  pidiendo hardware nuevo, sino un cambio en cuándo y con qué valor el
+  kernel programa el temporizador. En el reporte, márquenlo como hipótesis
+  apoyada en esa línea.
+- Camino 2: también es defendible. Si lo eligen, digan cuál es el error
+  máximo (¿cuánto puede pasarse un proceso, como mucho?) y comparen ese error
+  con el allotment de 10 ms. Revisen además que "descontarle el exceso en el
+  nivel siguiente" no choque con lo que decidieron sobre reiniciar el
+  allotment al bajar de cola.
+
+No necesitan elegir hoy, porque el alcance es una propuesta. Lo que sí deben
+hacer es dejar en el reporte las dos alternativas, con su costo y su relación
+con la Decisión 1, y si no se deciden, registrarlo como cuestión pendiente.
+
+Con la línea de tiempo corregida y este punto agregado a las partes B y 4, su
+descripción, los cambios propuestos y los escenarios quedan coherentes entre
+sí.
+
+
+----------------------------------------------------------------------
+[ESTUDIANTES]
+----------------------------------------------------------------------
+
+¡Qué vergüenza! Tienes toda la razón, se nos cruzaron los cables con nuestra
+propia Decisión 4. Como X fue expropiado, no se queda esperando en la puerta
+de la CPU, sino que se va al final de la cola media. Y como Y ya estaba
+esperando en esa misma cola, Y pasa a ser el primero en la fila.
+Aquí está la línea de tiempo rehecha paso a paso, aplicando bien nuestras
+reglas:
+
+Línea de tiempo corregida desde t = 2
+* t = 0: X empieza a ejecutarse en la cola media. (Lleva 7 ms acumulados, le
+  quedan 3 ms de quantum).
+* t = 1: Llega la tecla. A (cola alta) interrumpe a X de inmediato por la
+  expropiación (Regla 1a).
+  * Estado de X: Alcanzó a correr 1 ms. Acumula 8 ms y le quedan 2 ms de
+    quantum.
+  * Decisión 4 aplicada: X se va al final de la cola media. La cola media
+    ahora está así: [Y, X].
+* t = 1 a t = 2: A se ejecuta durante 1 ms y vuelve a bloquearse.
+* t = 2: La cola alta queda vacía. El planificador saca al primero de la cola
+  media, que ahora es Y.
+* t = 2 a t = 12: Y se ejecuta. Arranca desde 0 y consume sus 10 ms de
+  allotment / quantum completos.
+  * En t = 12: Y agota sus 10 ms y baja a la cola baja (Regla 4).
+* t = 12: El planificador saca al siguiente en la cola media, que es X.
+* t = 12 a t = 14: X se ejecuta para consumir los 2 ms que le quedaban
+  pendientes.
+  * En t = 14: X alcanza sus 10 ms acumulados (8 ms que ya traía + 2 ms) y
+    baja a la cola baja (Regla 4).
+
+Conclusión sobre los instantes exactos: Y debería bajar exactamente en
+t = 12, y X debería bajar exactamente en t = 14. Ninguno de los dos coincide
+con los ticks fijos del reloj (t = 10 o t = 15). El problema de fondo se
+mantiene: el kernel ciego a lo que pasa entre los ticks no puede aplicar la
+regla en el milisegundo exacto.
+
+Actualización del Reporte: Las dos alternativas para la Parte B y Parte 4
+Como nos sugeriste, no vamos a casarnos con una sola salida, sino que
+dejaremos ambas opciones documentadas en el reporte con sus costos y choques
+con la Decisión 1, anotándolas como la gran "cuestión pendiente" de nuestra
+propuesta:
+
+Alternativa 1 (Camino 1): Temporizador Dinámico (Modificar el hardware/kernel)
+* La propuesta: En lugar de ticks fijos, el kernel programa la siguiente
+  interrupción de reloj exactamente para el momento en que el proceso actual
+  deba agotar su quantum o allotment.
+* Evidencia (Hipótesis): La línea w_stimecmp(r_time() + 1000000) en trap.c.
+  Ese 1000000 nos dice que es el propio kernel quien decide cuánto falta para
+  la próxima interrupción sumándole un valor al tiempo actual. No necesitamos
+  hardware nuevo, "solo" cambiar la lógica de xv6 para que ese número sea
+  variable según el proceso en turno.
+* Costo: Complejidad en el planificador. Cada vez que hace un cambio de
+  contexto, tiene que calcular el tiempo exacto que le queda al proceso,
+  convertirlo a ciclos de reloj y programar el timer.
+* Relación con Decisión 1: Permite que la contabilidad estricta y perfecta se
+  cumpla al milisegundo.
+
+Alternativa 2 (Camino 2): Muestreo Retrasado (Relajar la variante)
+* La propuesta: Mantener los ticks fijos cada 5 ms. Aceptar que el
+  planificador solo se entera tarde de que un proceso se pasó de su tiempo, y
+  degradarlo en el siguiente tick disponible.
+* Costo / Error máximo: Como el tick es cada 5 ms, un proceso podría pasarse
+  por casi 5 ms enteros (por ejemplo, si le faltaba 0.1 ms de allotment en
+  t=10.1, correrá hasta t=15). ¡Eso es un error del 50% respecto a nuestro
+  allotment de 10 ms! Es demasiada CPU extra regalada.
+* Relación con Decisión 1 (El choque conceptual): Si elegimos castigar ese
+  exceso descontándolo en el siguiente nivel, chocaríamos con la definición
+  de que el nivel inferior no tiene allotment (es infinito), o de que el
+  allotment arranca en cero al entrar a la cola. Relajar la Decisión 1 haría
+  el algoritmo mucho más desordenado de predecir.
+
+Dejaremos esto estructurado como el debate principal para el cierre del
+documento. Todo cobra mucho más sentido cuando te das cuenta de que el
+sistema operativo está lidiando con un reloj físico y no solo con teoría.
+
+
+----------------------------------------------------------------------
+[TUTOR]
+----------------------------------------------------------------------
+
+La línea de tiempo corregida está bien: Y baja en t = 12 y X en t = 14,
+ninguno de los dos instantes coincide con un tick, y aplicaron la Decisión 4
+correctamente. Con eso pasaron la prueba de consistencia: el caso combinó las
+Reglas 1, 2 y 4, las Decisiones 1 y 4 y la granularidad del reloj, y todo
+encaja.
+
+Antes de entregar, revisen tres detalles:
+
+- El título de la Alternativa 1 dice "Modificar el hardware/kernel", pero en
+  el texto ustedes mismos concluyen que no hace falta hardware nuevo. Hagan
+  coincidir el título con la conclusión.
+- El error máximo de la Alternativa 2 está bien estimado: cerca de un tick, o
+  sea, casi 5 ms sobre un allotment de 10 ms. También podrían anotar que ese
+  error depende del tamaño del tick y no del algoritmo. Si en el futuro
+  vuelve a cambiar la frecuencia, el problema cambia de escala, pero sigue
+  existiendo.
+- En la Alternativa 1, separen dos cosas: la línea
+  w_stimecmp(r_time() + 1000000) está observada, mientras que la idea de que
+  el kernel puede escribir ahí cualquier valor sin consecuencias en otras
+  partes es una hipótesis. Esto se conecta con el pendiente que ya tienen
+  sobre lo que depende del tick, como sleep() o uptime. Si el intervalo deja
+  de ser fijo, ¿qué significa "un tick"?
+
+Con esto, sus tres objetivos quedan cubiertos con sus propias palabras y
+decisiones:
+
+- A: una variante coherente, con reglas y decisiones justificadas.
+- B: necesidades de cambio en XV6, cada una ligada a una regla y con la
+  evidencia clasificada como observada o hipótesis.
+- C: tres escenarios con diferencias observables.
+
+La lista de pendientes deja claro hasta dónde llega la propuesta. Hicieron un
+buen trabajo.
+
+======================================================================
+FIN DE LA CONVERSACIÓN
